@@ -1,0 +1,29 @@
+    @Override
+    public BaseResponse<ModelBuildPackageStatusVO> getBuildPackageInfo(Long modelId) {
+        OpsModel model = opsModelService.getById(modelId);
+        if (ObjectUtil.isEmpty(model)) {
+            return ResultUtils.error(500, "模型不存�?);
+        }
+        try {
+            BuildPackageInfoVO packageInfo = loadBuildPackageInfo(modelId, model.getType());
+            return ResultUtils.success(packageInfo, "获取成功");
+        } catch (Exception e) {
+            return ResultUtils.error(500, "获取构建包信息失�?);
+        }
+    }
+
+    @Override
+    public BaseResponse<ModelBuildPackageStatusVO> replaceBuildPackage(Long modelId, MultipartFile file) {
+        OpsModel model = opsModelService.getById(modelId);
+        if (ObjectUtil.isEmpty(model)) {
+            return ResultUtils.error(500, "模型不存�?);
+        }
+        if (file == null || file.isEmpty()) {
+            return ResultUtils.error(500, "未上传新的构建压缩包");
+        }
+        try {
+            Path workspaceDir = resolveModelWorkspaceDir(modelId);
+            BuildPackageInfoVO info = replaceBuildPackageInternal(modelId, model.getType(), file, workspaceDir);
+            return ResultUtils.success(info, "替换成功");
+        } catch (Exception e) {
+            return ResultUtils.error(500, "替换构建包失�?);
