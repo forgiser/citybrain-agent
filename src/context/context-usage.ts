@@ -1,0 +1,200 @@
+import type { ModelUsage, ChatMessage, ChatToolDefinition } from "../models/model-chat.js";
+
+export type ContextUsageStage = "before_request" | "after_response";
+export type ContextUsageSource =
+  | "provider_usage"
+  | "message_estimate"
+  | "provider_usage_plus_estimate";
+export type ContextWindowSource = "model_metadata" | "fallback";
+
+export interface ContextUsageSnapshot {
+  runId: string;
+  turn: number;
+  requestIndex: number;
+  provider: string;
+  model: string;
+  stage: ContextUsageStage;
+  contextWindow: number;
+  contextWindowSource: ContextWindowSource;
+  contextTokens: number;
+  estimated: boolean;
+  source: ContextUsageSource;
+  percent: number;
+  availableTokens: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+}
+
+export function getContextTokensFromUsage(usage: ModelUsage): number {
+  return usage.totalTokens > 0
+    ? usage.totalTokens
+    : usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+export function getPromptTokensFromUsage(usage: ModelUsage): number {
+  return usage.input + usage.cacheRead + usage.cacheWrite;
+}
+
+export function createProviderUsageSnapshot(
+  base: Omit<
+    ContextUsageSnapshot,
+    | "contextTokens"
+    | "estimated"
+    | "source"
+    | "percent"
+    | "availableTokens"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheWriteTokens"
+    | "totalTokens"
+  >,
+  usage: ModelUsage,
+): ContextUsageSnapshot {
+  return createSnapshot(base, getContextTokensFromUsage(usage), false, "provider_usage", usage);
+}
+
+export function createEstimatedUsageSnapshot(
+  base: Omit<
+    ContextUsageSnapshot,
+    | "contextTokens"
+    | "estimated"
+    | "source"
+    | "percent"
+    | "availableTokens"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheWriteTokens"
+    | "totalTokens"
+  >,
+  contextTokens: number,
+): ContextUsageSnapshot {
+  return createSnapshot(base, contextTokens, true, "message_estimate");
+}
+
+export function createHybridUsageSnapshot(
+  base: Omit<
+    ContextUsageSnapshot,
+    | "contextTokens"
+    | "estimated"
+    | "source"
+    | "percent"
+    | "availableTokens"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheWriteTokens"
+    | "totalTokens"
+  >,
+  usage: ModelUsage,
+  trailingTokens: number,
+): ContextUsageSnapshot {
+  return createSnapshot(
+    base,
+    getContextTokensFromUsage(usage) + Math.max(0, trailingTokens),
+    true,
+    "provider_usage_plus_estimate",
+    usage,
+  );
+}
+
+export function estimateChatContextTokens(
+  messages: readonly ChatMessage[],
+  tools: readonly ChatToolDefinition[] = [],
+  baseline?: {
+    usage: ModelUsage;
+    messageCount: number;
+  },
+): number {
+  if (
+    baseline &&
+    baseline.messageCount >= 0 &&
+    baseline.messageCount <= messages.length
+  ) {
+    const trailingCharacters = messages
+      .slice(baseline.messageCount)
+      .reduce((total, message) => total + estimateMessageCharacters(message), 0);
+    return getContextTokensFromUsage(baseline.usage) +
+      Math.ceil(trailingCharacters / 4);
+  }
+
+  const messageCharacters = messages.reduce(
+    (total, message) => total + estimateMessageCharacters(message),
+    0,
+  );
+  const toolCharacters = tools.length > 0 ? safeJsonStringify(tools).length : 0;
+  return Math.ceil((messageCharacters + toolCharacters) / 4);
+}
+
+function createSnapshot(
+  base: Omit<
+    ContextUsageSnapshot,
+    | "contextTokens"
+    | "estimated"
+    | "source"
+    | "percent"
+    | "availableTokens"
+    | "inputTokens"
+    | "outputTokens"
+    | "cacheReadTokens"
+    | "cacheWriteTokens"
+    | "totalTokens"
+  >,
+  contextTokens: number,
+  estimated: boolean,
+  source: ContextUsageSource,
+  usage?: ModelUsage,
+): ContextUsageSnapshot {
+  const safeContextTokens = Math.max(0, Math.ceil(contextTokens));
+  const availableTokens = Math.max(0, base.contextWindow - safeContextTokens);
+  return {
+    ...base,
+    contextTokens: safeContextTokens,
+    estimated,
+    source,
+    percent: base.contextWindow > 0
+      ? (safeContextTokens / base.contextWindow) * 100
+      : 0,
+    availableTokens,
+    ...(usage
+      ? {
+          inputTokens: usage.input,
+          outputTokens: usage.output,
+          cacheReadTokens: usage.cacheRead,
+          cacheWriteTokens: usage.cacheWrite,
+          totalTokens: usage.totalTokens,
+        }
+      : {}),
+  };
+}
+
+function estimateMessageCharacters(message: ChatMessage): number {
+  let characters = message.content.length;
+
+  if (message.role === "assistant" && message.toolCalls) {
+    for (const toolCall of message.toolCalls) {
+      characters += toolCall.name.length + toolCall.arguments.length;
+    }
+  }
+
+  if (message.toolCallId) {
+    characters += message.toolCallId.length;
+  }
+  if (message.toolName) {
+    characters += message.toolName.length;
+  }
+
+  return characters;
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "[unserializable]";
+  }
+}

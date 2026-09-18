@@ -10,6 +10,13 @@ import {
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { getCityBrainDir } from "../auth/auth-storage.js";
+import { getContextTokensFromUsage } from "../context/context-usage.js";
+import {
+  createCompactionPlan,
+  estimateMessages,
+  type CompactionPlan,
+} from "../context/context-compaction.js";
+import { getWorkspaceDir as resolveWorkspaceDir } from "../workspace/workspace.js";
 import type { ChatMessage, ModelUsage } from "../models/model-chat.js";
 import type {
   ContextUsage,
@@ -20,6 +27,8 @@ import type {
   SessionInfo,
   SessionMessage,
   SessionMessageEntry,
+  CompactionEntry,
+  SessionEntryBase,
 } from "./session-types.js";
 
 const SESSION_VERSION = 1;
@@ -150,6 +159,17 @@ export class SessionManager {
     return this.header.cwd;
   }
 
+  /** 文件系统沙箱目录（citybrain/ 工作区）的绝对路径。 */
+  getWorkspaceDir(): string {
+    return this.header.workspaceDir ?? resolveWorkspaceDir(this.header.cwd);
+  }
+
+  /** 记录/变更沙箱目录并持久化到会话头，避免重启或 /resume 后丢失。 */
+  setWorkspaceDir(path: string): void {
+    this.header.workspaceDir = resolve(path);
+    this.persistHeader();
+  }
+
   getEntries(): SessionEntry[] {
     return [...this.entries];
   }
@@ -164,6 +184,7 @@ export class SessionManager {
       modifiedAt,
       messageCount: this.entries.filter((entry) => entry.type === "message").length,
       firstMessage,
+      compactionCount: this.entries.filter((entry) => entry.type === "compaction").length,
     };
   }
 
@@ -172,37 +193,75 @@ export class SessionManager {
   }
 
   getContextMessages(): ChatMessage[] {
-    return this.entries
+    const boundaryIndex = this.findLatestCompactionIndex();
+    const messages = this.entries
+      .slice(boundaryIndex + 1)
       .filter((entry): entry is SessionMessageEntry => entry.type === "message")
       .map((entry) => ({
         role: entry.message.role,
         content: entry.message.content,
+        ...(entry.message.toolCalls ? { toolCalls: entry.message.toolCalls } : {}),
+        ...(entry.message.toolCallId ? { toolCallId: entry.message.toolCallId } : {}),
+        ...(entry.message.toolName ? { toolName: entry.message.toolName } : {}),
       }));
+    if (boundaryIndex < 0) return messages;
+    const boundary = this.entries[boundaryIndex];
+    if (!boundary || boundary.type !== "compaction") return messages;
+    return [
+      { role: "user", content: boundary.summary },
+      ...boundary.retainedMessages,
+      ...messages,
+    ];
+  }
+
+  compactContext(
+    contextWindow: number,
+    systemPrompt: string,
+    tools: unknown[],
+    reason: string,
+  ): CompactionPlan | undefined {
+    const currentMessages = this.getContextMessages();
+    const estimatedTokens = Math.ceil(
+      (systemPrompt.length + JSON.stringify(tools).length) / 4,
+    ) + estimateMessages(currentMessages);
+    if (estimatedTokens <= contextWindow - 16_384) return undefined;
+
+    const plan = createCompactionPlan(currentMessages);
+    if (!plan) return undefined;
+    this.appendCompaction({
+      summary: plan.summary,
+      retainedMessages: plan.keptMessages.slice(1),
+      tokensBefore: plan.tokensBefore,
+      tokensAfter: plan.tokensAfter,
+      keptMessages: plan.keptMessages.length,
+      removedMessages: plan.removedMessages,
+      reason,
+    });
+    return plan;
   }
 
   getContextUsage(contextWindow: number = DEFAULT_CONTEXT_WINDOW): ContextUsage {
-    const messages = this.entries.filter(
+    const boundaryIndex = this.findLatestCompactionIndex();
+    const messages = this.entries.slice(boundaryIndex + 1).filter(
       (entry): entry is SessionMessageEntry => entry.type === "message",
     );
     const safeContextWindow = contextWindow > 0 ? contextWindow : DEFAULT_CONTEXT_WINDOW;
     const usageInfo = getLastAssistantUsageInfo(messages);
 
     if (!usageInfo) {
-      const tokens = messages.reduce(
-        (sum, entry) => sum + estimateMessageTokens(entry.message),
-        0,
-      );
+      const tokens = estimateMessages(this.getContextMessages());
       return createContextUsage(tokens, safeContextWindow, 0, tokens, true);
     }
 
     const trailingTokens = messages
       .slice(usageInfo.index + 1)
-      .reduce((sum, entry) => sum + estimateMessageTokens(entry.message), 0);
-    const tokens = usageInfo.usage.totalTokens + trailingTokens;
+      .reduce((sum, entry) => sum + estimateMessages([toChatMessage(entry.message)]), 0);
+    const usageTokens = getContextTokensFromUsage(usageInfo.usage);
+    const tokens = usageTokens + trailingTokens;
     return createContextUsage(
       tokens,
       safeContextWindow,
-      usageInfo.usage.totalTokens,
+      usageTokens,
       trailingTokens,
       trailingTokens > 0,
     );
@@ -258,6 +317,18 @@ export class SessionManager {
     return entry.id;
   }
 
+  appendCompaction(input: Omit<CompactionEntry, keyof SessionEntryBase | "type">): string {
+    const entry: CompactionEntry = {
+      type: "compaction",
+      id: createEntryId(),
+      parentId: this.getLeafId(),
+      timestamp: new Date().toISOString(),
+      ...input,
+    };
+    this.appendEntry(entry);
+    return entry.id;
+  }
+
   newSession(cwd: string = this.header.cwd): void {
     this.header = createHeader(cwd);
     const sessionsRoot = dirname(dirname(this.sessionFile));
@@ -272,6 +343,13 @@ export class SessionManager {
 
   private getLeafId(): string | null {
     return this.entries.at(-1)?.id ?? null;
+  }
+
+  private findLatestCompactionIndex(): number {
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      if (this.entries[index]?.type === "compaction") return index;
+    }
+    return -1;
   }
 
   private appendEntry(entry: SessionEntry): void {
@@ -289,6 +367,14 @@ export class SessionManager {
         "utf8",
       );
     }
+  }
+
+  /** 把改动后的会话头写回文件首行（JSONL 首行即 header）。 */
+  private persistHeader(): void {
+    if (!this.isPersisted()) return;
+    const lines = readFileSync(this.sessionFile, "utf8").split(/\r?\n/u);
+    lines[0] = JSON.stringify(this.header);
+    writeFileSync(this.sessionFile, lines.join("\n"), "utf8");
   }
 
   private getModifiedAt(): number {
@@ -310,6 +396,7 @@ function createHeader(cwd: string): SessionHeader {
     id: createSessionId(),
     timestamp: new Date().toISOString(),
     cwd: resolve(cwd),
+    workspaceDir: resolveWorkspaceDir(cwd),
   };
 }
 
@@ -321,7 +408,8 @@ function isSessionFileEntry(value: unknown): value is SessionFileEntry {
       value.version === SESSION_VERSION &&
       typeof value.id === "string" &&
       typeof value.timestamp === "string" &&
-      typeof value.cwd === "string"
+      typeof value.cwd === "string" &&
+      (value.workspaceDir === undefined || typeof value.workspaceDir === "string")
     );
   }
 
@@ -337,11 +425,28 @@ function isSessionFileEntry(value: unknown): value is SessionFileEntry {
     return typeof value.provider === "string" && typeof value.modelId === "string";
   }
 
+  if (value.type === "compaction") {
+    return (
+      typeof value.summary === "string" &&
+      Array.isArray(value.retainedMessages) &&
+      typeof value.tokensBefore === "number" &&
+      typeof value.tokensAfter === "number" &&
+      typeof value.keptMessages === "number" &&
+      typeof value.removedMessages === "number" &&
+      typeof value.reason === "string"
+    );
+  }
+
   if (value.type === "message" && isRecord(value.message)) {
     return (
-      (value.message.role === "user" || value.message.role === "assistant") &&
+      (value.message.role === "user" ||
+        value.message.role === "assistant" ||
+        value.message.role === "tool") &&
       typeof value.message.content === "string" &&
       (value.message.thinking === undefined || typeof value.message.thinking === "string") &&
+      (value.message.toolCalls === undefined || Array.isArray(value.message.toolCalls)) &&
+      (value.message.toolCallId === undefined || typeof value.message.toolCallId === "string") &&
+      (value.message.toolName === undefined || typeof value.message.toolName === "string") &&
       (value.message.usage === undefined || isModelUsage(value.message.usage))
     );
   }
@@ -372,7 +477,7 @@ function getLastAssistantUsageInfo(
     if (
       message?.role === "assistant" &&
       message.usage &&
-      message.usage.totalTokens > 0
+      getContextTokensFromUsage(message.usage) > 0
     ) {
       return { usage: message.usage, index };
     }
@@ -380,8 +485,14 @@ function getLastAssistantUsageInfo(
   return undefined;
 }
 
-function estimateMessageTokens(message: SessionMessage): number {
-  return Math.ceil((message.content.length + (message.thinking?.length ?? 0)) / 4);
+function toChatMessage(message: SessionMessage): ChatMessage {
+  return {
+    role: message.role,
+    content: message.content,
+    ...(message.toolCalls ? { toolCalls: message.toolCalls } : {}),
+    ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+    ...(message.toolName ? { toolName: message.toolName } : {}),
+  };
 }
 
 function createContextUsage(

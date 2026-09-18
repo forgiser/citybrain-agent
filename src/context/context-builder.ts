@@ -92,6 +92,7 @@ function getToolSemantics(): string {
     "qgis list    — enumerate available QGIS processing algorithms.",
     "qgis describe — inspect one algorithm's inputs/outputs so you call it correctly.",
     "qgis run     — execute a full processing workflow, feeding earlier outputs to later steps.",
+    "list_files   — list files/directories under a directory (optionally filtered by glob).",
     "read_file    — read a file by absolute path when you need its raw content.",
     "Concurrency-safe tools may run in parallel; steps that depend on each other run sequentially.",
   ].join("\n");

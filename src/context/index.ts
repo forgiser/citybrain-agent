@@ -36,6 +36,26 @@ export {
   getAutocompactThreshold,
   getContextWindowForModel,
 } from "./context-window.js";
+export {
+  createEstimatedUsageSnapshot,
+  createHybridUsageSnapshot,
+  createProviderUsageSnapshot,
+  estimateChatContextTokens,
+  getContextTokensFromUsage,
+  getPromptTokensFromUsage,
+  type ContextUsageSnapshot,
+  type ContextUsageSource,
+  type ContextUsageStage,
+  type ContextWindowSource,
+} from "./context-usage.js";
+export {
+  COMPACTION_KEEP_RECENT_TOKENS,
+  COMPACTION_RESERVE_TOKENS,
+  createCompactionPlan,
+  estimateMessage,
+  estimateMessages,
+  type CompactionPlan,
+} from "./context-compaction.js";
 export type {
   ContextBlock,
   ContextBlocks,

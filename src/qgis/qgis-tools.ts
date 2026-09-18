@@ -8,10 +8,11 @@ import {
   executeQgisAlgorithm,
   listQgisAlgorithms,
 } from "./qgis-process-client.js";
+import type { ToolCallContext } from "../tools/tool-registry.js";
 
 export interface QgisTool {
   definition: ChatToolDefinition;
-  handler: (args: unknown) => Promise<string>;
+  handler: (args: unknown, context?: ToolCallContext) => Promise<string>;
   /**
    * Concurrency verdict for a parsed-arguments call. list/describe are
    * read-only and may run in parallel; run has side effects (writes output
@@ -19,6 +20,7 @@ export interface QgisTool {
    * parallel runs with distinct OUTPUT paths — is a later refinement.
    */
   isConcurrencySafe?: (args: unknown) => boolean;
+  producesArtifacts?: (args: unknown) => string[];
 }
 
 type RuntimeGetter = () => QgisRuntimeInfo | undefined;
@@ -51,7 +53,7 @@ function makeListTool(getRuntime: RuntimeGetter): QgisTool {
         },
       },
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       const runtime = requireRuntime(getRuntime());
       const parsed = (args ?? {}) as { filter?: unknown; limit?: unknown };
       const filter = typeof parsed.filter === "string" ? parsed.filter : undefined;
@@ -100,7 +102,7 @@ function makeDescribeTool(getRuntime: RuntimeGetter): QgisTool {
         },
       },
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       const runtime = requireRuntime(getRuntime());
       return describeQgisAlgorithm(runtime, getAlgorithmId(args));
     },
@@ -143,7 +145,7 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
         },
       },
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       const runtime = requireRuntime(getRuntime());
       const algorithmId = getAlgorithmId(args);
       const parsed = (args ?? {}) as {
@@ -173,10 +175,55 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
 
       resolveParameterPaths(parameters);
       const timeoutMs = getTimeoutMs(parsed.timeoutSeconds);
-      const result = await executeQgisAlgorithm(runtime, algorithmId, parameters, timeoutMs);
+      context?.emitProgress?.({
+        phase: "running",
+        message: `Running ${algorithmId}`,
+      });
+      let result;
+      try {
+        result = await executeQgisAlgorithm(
+          runtime,
+          algorithmId,
+          parameters,
+          timeoutMs,
+          {
+            signal: context?.signal,
+            onProgress: (progress) => {
+              context?.emitProgress?.({
+                phase: "running",
+                elapsedMs: progress.elapsedMs,
+                message: `Running ${algorithmId}`,
+                stdoutTail: progress.stdoutTail,
+                stderrTail: progress.stderrTail,
+              });
+            },
+          },
+        );
+      } catch (error) {
+        context?.emitProgress?.({
+          phase: "failed",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      const outputPaths = result.outputPaths;
+      context?.emitProgress?.({
+        phase: "verifying_outputs",
+        elapsedMs: result.durationMs,
+        message: "Verifying QGIS output files",
+        outputPaths,
+        missingOutputPaths: result.missingOutputPaths,
+      });
       if (!result.ok) {
+        context?.markArtifactsMissing?.(
+          result.missingOutputPaths.length > 0
+            ? result.missingOutputPaths
+            : outputPaths,
+          result.stdoutTail,
+        );
         throw new Error("qgis_process reported an error:\n" + result.stdoutTail);
       }
+      context?.markArtifactsReady?.(outputPaths);
       const parts = ["Algorithm " + algorithmId + " completed."];
       if (Object.keys(result.results).length > 0) {
         parts.push("Results: " + JSON.stringify(result.results, null, 2));
@@ -189,6 +236,7 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
     // Side effects (writes output files). Exclusive until path-collision-aware
     // refinement lands (parallel runs with distinct OUTPUT paths).
     isConcurrencySafe: () => false,
+    producesArtifacts: getQgisOutputPaths,
   };
 }
 
@@ -236,6 +284,26 @@ function resolveParameterPaths(
     if (!looksLikePath) continue;
     parameters[key] = resolveWorkspacePath(trimmed);
   }
+}
+
+function getQgisOutputPaths(args: unknown): string[] {
+  if (typeof args !== "object" || args === null) return [];
+  const rawParameters = (args as { parameters?: unknown }).parameters;
+  if (
+    typeof rawParameters !== "object" ||
+    rawParameters === null ||
+    Array.isArray(rawParameters)
+  ) {
+    return [];
+  }
+  const paths: string[] = [];
+  for (const [key, value] of Object.entries(rawParameters)) {
+    if (!/^OUTPUT(?:_|$)/iu.test(key) || typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed || /^TEMPORARY_OUTPUT$/iu.test(trimmed)) continue;
+    paths.push(resolveWorkspacePath(trimmed));
+  }
+  return paths;
 }
 
 function resolveWorkspacePath(value: string): string {

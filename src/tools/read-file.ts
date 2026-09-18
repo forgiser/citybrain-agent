@@ -1,6 +1,7 @@
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ChatToolDefinition } from "../models/model-chat.js";
+import type { ToolCallContext } from "./tool-registry.js";
 
 const DEFAULT_FILE_LINE_LIMIT = 1_000;
 const MAX_FILE_LINE_LIMIT = 10_000;
@@ -37,6 +38,7 @@ export const readFileToolDefinition: ChatToolDefinition = {
 export async function executeReadFile(
   args: unknown,
   cwd: string = process.cwd(),
+  context?: ToolCallContext,
 ): Promise<string> {
   if (!isRecord(args) || typeof args.path !== "string" || !args.path.trim()) {
     throw new Error("read_file requires a non-empty path.");
@@ -50,6 +52,33 @@ export async function executeReadFile(
   }
 
   const target = resolve(cwd, args.path);
+  const artifacts = context?.artifacts;
+  if (artifacts?.getPending(target)) {
+    const terminalArtifact = await artifacts.waitForTerminal(
+      target,
+      context?.signal,
+    );
+    if (terminalArtifact?.status === "missing") {
+      throw new Error(
+        [
+          "The producing task finished, but the artifact is missing.",
+          `task_id: ${terminalArtifact.producerTaskId}`,
+          `path: ${terminalArtifact.path}`,
+          terminalArtifact.error ?? "No additional error was reported.",
+        ].join("\n"),
+      );
+    }
+    if (terminalArtifact?.status === "invalid") {
+      throw new Error(
+        [
+          "The producing task finished, but the artifact is invalid.",
+          `task_id: ${terminalArtifact.producerTaskId}`,
+          `path: ${terminalArtifact.path}`,
+          terminalArtifact.error ?? "No additional error was reported.",
+        ].join("\n"),
+      );
+    }
+  }
   const fileInfo = await lstat(target);
   if (!fileInfo.isFile()) {
     throw new Error(`Not a regular file: ${args.path}`);

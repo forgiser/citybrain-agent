@@ -18,13 +18,17 @@ import {
   type SlashCommand,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { join } from "node:path";
 import { styleText } from "node:util";
 import { AgentLoop } from "../agent/agent-loop.js";
 import type {
   ToolExecutionResult,
   ToolExecutionStarted,
+  ToolProgress,
 } from "../agent/agent-loop.js";
 import type { AgentStatusUpdate } from "../agent/agent-status.js";
+import type { AgentHarnessStateUpdate } from "../agent/agent-state.js";
+import type { ContextUsageSnapshot } from "../context/context-usage.js";
 import { AuthStorage } from "../auth/auth-storage.js";
 import { LoginDialog } from "../auth/login-dialog.js";
 import {
@@ -68,8 +72,19 @@ import {
   executeReadFile,
   readFileToolDefinition,
 } from "../tools/read-file.js";
+import {
+  executeListFiles,
+  listFilesToolDefinition,
+} from "../tools/list-files.js";
 import { createSubagentTool } from "../tools/subagent-tool.js";
+import { ContextUsageLogger } from "../context/context-usage-log.js";
+import { ContextTraceLogger } from "../context/context-trace-log.js";
+import { ToolExecutionLogger } from "../tools/tool-execution-log.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
+import {
+  ensureWorkspace,
+  type WorkspaceInfo,
+} from "../workspace/workspace.js";
 import { findShellCommand, shellCommands } from "./shell-commands.js";
 
 const VERSION = "0.1.0";
@@ -133,8 +148,26 @@ export async function startInteractiveApp(): Promise<void> {
   let session = SessionManager.create(process.cwd());
   let qgisRuntime = await detectQgisRuntime();
   let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
-  const toolRegistry = new ToolRegistry();
-  toolRegistry.register(readFileToolDefinition, (args) => executeReadFile(args));
+  const toolLogger = new ToolExecutionLogger(
+    () => join(session.getWorkspaceDir(), ".internal", "tool-execution.jsonl"),
+  );
+  const contextLogger = new ContextUsageLogger(
+    () => join(session.getWorkspaceDir(), ".internal", "context-usage.jsonl"),
+  );
+  const contextTraceLogger = new ContextTraceLogger(
+    () => join(session.getWorkspaceDir(), ".internal", "context-trace.jsonl"),
+  );
+  const toolRegistry = new ToolRegistry({ logger: toolLogger });
+  toolRegistry.register(
+    readFileToolDefinition,
+    (args, toolContext) => executeReadFile(args, session.getCwd(), toolContext),
+    { isConcurrencySafe: () => true },
+  );
+  toolRegistry.register(
+    listFilesToolDefinition,
+    (args) => executeListFiles(args, session.getCwd()),
+    { isConcurrencySafe: () => true },
+  );
   for (const tool of createQgisTools(() => qgisRuntime)) {
     toolRegistry.register(tool.definition, tool.handler, {
       isConcurrencySafe: tool.isConcurrencySafe,
@@ -145,12 +178,22 @@ export async function startInteractiveApp(): Promise<void> {
     authStorage,
     getCwd: () => session.getCwd(),
     getQgisRuntime: () => qgisRuntime,
+    toolLogger,
+    contextLogger,
     options: { thinkingLevel },
   });
   toolRegistry.register(delegateTool.definition, delegateTool.handler, {
     isConcurrencySafe: delegateTool.isConcurrencySafe,
   });
-  const agentLoop = new AgentLoop(modelRuntime, authStorage, session, toolRegistry);
+  const agentLoop = new AgentLoop(
+    modelRuntime,
+    authStorage,
+    session,
+    toolRegistry,
+    toolLogger,
+    contextLogger,
+    contextTraceLogger,
+  );
   const terminal = new ProcessTerminal();
   const tui: TUI = new TuiMainScreen(terminal, true);
   const editor = new Editor(tui, editorTheme, {
@@ -161,9 +204,13 @@ export async function startInteractiveApp(): Promise<void> {
   const transcript: Component[] = [];
   const modelStatus = new FooterStatus();
   const agentStatusFooter = new AgentStatusFooter();
+  const sandboxStatus = new SandboxStatus();
+  sandboxStatus.setPath(session.getWorkspaceDir());
   const setSession = (nextSession: SessionManager): void => {
     session = nextSession;
     agentLoop.setSession(nextSession);
+    sandboxStatus.setPath(nextSession.getWorkspaceDir());
+    tui.requestRender();
   };
   const setQgisRuntime = (nextRuntime: QgisRuntimeInfo | undefined): void => {
     qgisRuntime = nextRuntime;
@@ -173,6 +220,7 @@ export async function startInteractiveApp(): Promise<void> {
   tui.addChild(editor);
   tui.addChild(agentStatusFooter);
   tui.addChild(modelStatus);
+  tui.addChild(sandboxStatus);
   tui.setFocus(editor);
   editor.setAutocompleteProvider(createAutocompleteProvider(modelRuntime));
   updateModelStatus({ modelRuntime, modelStatus, session, thinkingLevel, tui });
@@ -233,6 +281,7 @@ export async function startInteractiveApp(): Promise<void> {
         modelRuntime,
         modelStatus,
         agentStatusFooter,
+        sandboxStatus,
         session,
         setSession,
         setThinkingLevel: (level) => {
@@ -303,6 +352,7 @@ interface SubmitContext {
   modelRuntime: ModelRuntime;
   modelStatus: FooterStatus;
   agentStatusFooter: AgentStatusFooter;
+  sandboxStatus: SandboxStatus;
   session: SessionManager;
   setSession: (session: SessionManager) => void;
   qgisRuntime: QgisRuntimeInfo | undefined;
@@ -362,12 +412,24 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
       case "/qgis":
         await handleQgisCommand(getCommandArgument(input), context);
         return;
+      case "/init":
+        await handleInitCommand(getCommandArgument(input), context);
+        return;
       case "/login":
         await handleLoginCommand(getCommandArgument(input), context);
         return;
       case "/logout":
         await handleLogoutCommand(getCommandArgument(input), context);
         return;
+    }
+  }
+
+  // First question of a session: ensure the project workspace skeleton exists,
+  // creating it under the session's working directory if missing.
+  if (context.session.getMessageCount() === 0) {
+    const info = ensureWorkspace(context.session.getCwd());
+    if (info.created.length > 0) {
+      addTranscript(context, createWorkspaceMessage(info));
     }
   }
 
@@ -418,6 +480,15 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
         context.tui.requestRender();
         continue;
       }
+      if (event.type === "tool_progress") {
+        if (event.name !== "delegate") {
+          responseComponent.setToolStatus(
+            createToolProgressMessage(event.name, event.progress),
+          );
+        }
+        context.tui.requestRender();
+        continue;
+      }
       if (event.type === "tool_result") {
         responseComponent.setToolStatus("");
         if (event.name !== "delegate") {
@@ -431,7 +502,19 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
         context.tui.requestRender();
         continue;
       }
+      if (event.type === "state") {
+        responseComponent.setHarnessStatus(formatHarnessStatus(event));
+        context.tui.requestRender();
+        continue;
+      }
+      if (event.type === "context") {
+        context.modelStatus.setContextUsage(event.snapshot);
+        responseComponent.setContextUsage(event.snapshot);
+        context.tui.requestRender();
+        continue;
+      }
     }
+    responseComponent.setHarnessStatus("");
     responseComponent.setContent(thinkingText, responseText, false);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -463,6 +546,9 @@ function renderStoredSession(
 ): void {
   for (const entry of context.session.getEntries()) {
     if (entry.type === "message") {
+      if (entry.message.role === "tool" || entry.message.toolCalls?.length) {
+        continue;
+      }
       addTranscript(context, createSessionMessage(entry));
     }
   }
@@ -537,6 +623,7 @@ function createSessionStateMessage(
     [
       color("────────────────────────────────────────────────"),
       `${color(title)}  ${colors.dim(info.id.slice(0, 8))}  ${colors.dim(detail)}${session.isPersisted() ? "" : `  ${colors.dim("(not saved)")}`}`,
+      `${colors.dim("sandbox")}  ${colors.dim(session.getWorkspaceDir())}`,
       color("────────────────────────────────────────────────"),
     ].join("\n"),
     2,
@@ -785,6 +872,135 @@ async function handleLogoutCommand(
       2,
       0,
     ),
+  );
+}
+
+const INIT_USE_CURRENT = "__current__";
+const INIT_CHOOSE_OTHER = "__choose__";
+
+async function handleInitCommand(
+  targetArgument: string | undefined,
+  context: SubmitContext,
+): Promise<void> {
+  if (targetArgument && targetArgument.split(/\s+/).length > 1) {
+    addTranscript(
+      context,
+      new Text(`${colors.yellow("usage")}  /init [<target-folder>]`, 2, 0),
+    );
+    return;
+  }
+
+  let targetDir = targetArgument?.trim();
+  if (!targetDir) {
+    const choice = await selectInitTarget(context);
+    if (!choice) {
+      addTranscript(context, new Text(colors.dim("Init cancelled."), 2, 0));
+      return;
+    }
+    if (choice === INIT_CHOOSE_OTHER) {
+      targetDir = await promptWorkspacePath(context);
+      if (!targetDir) {
+        addTranscript(context, new Text(colors.dim("Init cancelled."), 2, 0));
+        return;
+      }
+    } else {
+      targetDir = context.session.getCwd();
+    }
+  }
+
+  try {
+    const info = ensureWorkspace(targetDir);
+    context.session.setWorkspaceDir(info.workspaceDir);
+    context.sandboxStatus.setPath(info.workspaceDir);
+    addTranscript(context, createWorkspaceMessage(info));
+  } catch (error) {
+    addTranscript(
+      context,
+      new Text(
+        `${colors.red("init failed")}  ${error instanceof Error ? error.message : String(error)}`,
+        2,
+        0,
+      ),
+    );
+  }
+}
+
+async function selectInitTarget(context: SubmitContext): Promise<string | undefined> {
+  const selector = new SelectList(
+    [
+      {
+        value: INIT_USE_CURRENT,
+        label: "当前文件夹（默认）",
+        description: context.session.getCwd(),
+      },
+      {
+        value: INIT_CHOOSE_OTHER,
+        label: "选择其他文件夹...",
+        description: "输入目标文件夹路径，在其下创建 citybrain/",
+      },
+    ],
+    2,
+    editorTheme.selectList,
+  );
+  const selectorIndex = context.tui.children.indexOf(context.editor);
+  const titleComponent = new Text(colors.cyan("  初始化 CityBrain 项目工作区"), 2, 0);
+  context.tui.children.splice(selectorIndex, 0, titleComponent);
+  context.tui.children.splice(selectorIndex + 1, 0, selector);
+  context.tui.setFocus(selector);
+  context.tui.requestRender();
+
+  return new Promise<string | undefined>((resolve) => {
+    const finish = (value: string | undefined): void => {
+      context.tui.removeChild(titleComponent);
+      context.tui.removeChild(selector);
+      context.tui.setFocus(context.editor);
+      context.tui.requestRender();
+      resolve(value);
+    };
+    selector.onSelect = (item) => finish(item.value);
+    selector.onCancel = () => finish(undefined);
+  });
+}
+
+async function promptWorkspacePath(context: SubmitContext): Promise<string | undefined> {
+  const dialog = new PathInputDialog(
+    context.tui,
+    "初始化工作区 — 目标文件夹",
+    colors.cyan,
+    colors.dim,
+    [
+      "输入目标文件夹路径，将在其下创建 citybrain/ 目录骨架",
+      "例如  E:\\projects\\蒲胶流域",
+    ],
+  );
+  const editorIndex = context.tui.children.indexOf(context.editor);
+  context.tui.children.splice(editorIndex, 0, dialog);
+  context.tui.setFocus(dialog);
+  context.tui.requestRender();
+
+  const path = await dialog.open();
+  context.tui.removeChild(dialog);
+  context.tui.setFocus(context.editor);
+  context.tui.requestRender();
+
+  const cleaned = path?.trim().replace(/^(["'])(.*)\1$/u, "$2");
+  return cleaned || undefined;
+}
+
+function createWorkspaceMessage(info: WorkspaceInfo): Text {
+  const status = info.alreadyInitialized
+    ? colors.cyan("workspace ready")
+    : colors.green("workspace initialized");
+  const createdNote =
+    info.created.length > 0
+      ? colors.dim(
+          `  created ${info.created.length} path${info.created.length > 1 ? "s" : ""}`,
+        )
+      : colors.dim("  already up to date");
+  return new Text(
+    [status, `  ${info.workspaceDir}`, createdNote].join("\n"),
+    2,
+    0,
   );
 }
 
@@ -1573,7 +1789,7 @@ function updateModelStatus(
     (totals?.input ?? 0) + (totals?.cacheRead ?? 0) + (totals?.cacheWrite ?? 0);
   const outputTokens = totals?.output ?? 0;
   const usageText = usage
-    ? `${usage.percent.toFixed(1)}%/${formatTokenCount(usage.contextWindow)}`
+    ? `${usage.percent.toFixed(1)}%/${formatTokenCount(usage.contextWindow)} (${usage.estimated ? "estimated" : "provider"})`
     : `0.0%/${formatTokenCount(selected.contextWindow ?? DEFAULT_CONTEXT_WINDOW)}`;
   context.modelStatus.setParts(
     [
@@ -1592,6 +1808,24 @@ function formatTokenCount(tokens: number): string {
   if (tokens < 10_000) return `${(tokens / 1000).toFixed(1)}k`;
   if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
   return `${(tokens / 1_000_000).toFixed(1)}M`;
+}
+
+function formatContextUsage(snapshot: ContextUsageSnapshot): string {
+  const marker = snapshot.estimated ? "~" : "=";
+  const source = snapshot.source === "provider_usage_plus_estimate"
+    ? "provider+estimate"
+    : snapshot.estimated
+      ? "estimated"
+      : "provider";
+  const windowSource = snapshot.contextWindowSource === "model_metadata"
+    ? "limit:model"
+    : "limit:fallback";
+  return [
+    `context ${marker}${formatTokenCount(snapshot.contextTokens)}/${formatTokenCount(snapshot.contextWindow)}`,
+    `${snapshot.percent.toFixed(1)}%`,
+    source,
+    windowSource,
+  ].join(" ");
 }
 
 function createMarkdownTheme(): MarkdownTheme {
@@ -1636,6 +1870,20 @@ function createToolRunningMessage(event: ToolExecutionStarted): string {
   return target ? `Running ${event.name}: ${target}` : `Running ${event.name}...`;
 }
 
+function createToolProgressMessage(name: string, progress: ToolProgress): string {
+  const phase =
+    progress.phase === "verifying_outputs"
+      ? "verifying outputs"
+      : progress.phase === "running"
+        ? "running"
+        : progress.phase;
+  const elapsed = progress.elapsedMs
+    ? `  ${Math.floor(progress.elapsedMs / 1000)}s`
+    : "";
+  const detail = progress.message ? `  ${truncateSingleLine(progress.message, 120)}` : "";
+  return `${colors.dim(`${name} ${phase}${elapsed}`)}${detail}`;
+}
+
 function createToolDisplayText(event: ToolExecutionResult): string {
   const target = getToolTarget(event.argumentsText);
   const header = createToolHeader(event.name, target);
@@ -1667,6 +1915,30 @@ function formatAgentStatusLine(agent: AgentStatusUpdate): string {
   const status = renderAgentStatus(agent);
   const tokenLine = agent.usage ? "  " + formatAgentUsage(agent.usage) : "";
   return `${name}${status}${tokenLine}`;
+}
+
+function formatHarnessStatus(state: AgentHarnessStateUpdate): string {
+  switch (state.state) {
+    case "streaming_model":
+      return state.reason === "requesting final answer without tools"
+        ? "Preparing final answer..."
+        : "Thinking...";
+    case "waiting_for_tools":
+      return state.reason ? `Waiting for ${state.reason}` : "Waiting for tools...";
+    case "executing_tools":
+      return "Executing tools...";
+    case "finalizing":
+      return state.reason
+        ? `Finalizing safely: ${state.reason}`
+        : "Finalizing safely...";
+    case "failed":
+    case "aborted":
+      return `${state.state}: ${state.reason ?? "run stopped"}`;
+    case "completed":
+      return "";
+    default:
+      return "";
+  }
 }
 
 function renderAgentStatus(agent: AgentStatusUpdate): string {
@@ -1719,6 +1991,8 @@ class AssistantResponseComponent extends Container {
   private showThinking = true;
   private toolStatus = "";
   private toolResults: ToolExecutionResult[] = [];
+  private harnessStatus = "";
+  private contextUsage = "";
 
   setContent(
     thinking: string,
@@ -1736,6 +2010,16 @@ class AssistantResponseComponent extends Container {
 
   setToolStatus(status: string): void {
     this.toolStatus = status;
+    this.rebuild();
+  }
+
+  setHarnessStatus(status: string): void {
+    this.harnessStatus = status;
+    this.rebuild();
+  }
+
+  setContextUsage(snapshot: ContextUsageSnapshot): void {
+    this.contextUsage = formatContextUsage(snapshot);
     this.rebuild();
   }
 
@@ -1774,6 +2058,14 @@ class AssistantResponseComponent extends Container {
 
     if (this.toolStatus) {
       this.addChild(new Text(colors.dim(this.toolStatus), 2, 0));
+    }
+
+    if (this.harnessStatus) {
+      this.addChild(new Text(colors.dim(this.harnessStatus), 2, 0));
+    }
+
+    if (this.contextUsage) {
+      this.addChild(new Text(colors.dim(this.contextUsage), 2, 0));
     }
 
     for (const toolResult of this.toolResults) {
@@ -1950,13 +2242,38 @@ class AgentStatusFooter implements Component {
   }
 }
 
+/** Persistent bottom line showing the active file-system sandbox (citybrain/). */
+class SandboxStatus implements Component {
+  private path = "";
+
+  setPath(path: string): void {
+    this.path = path;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    if (!this.path) return [];
+    const innerWidth = Math.max(1, width - 1);
+    return [
+      ` ${truncateToWidth(`${colors.cyan("sandbox")}  ${colors.dim(this.path)}`, innerWidth, "")}`,
+    ];
+  }
+}
+
 class FooterStatus implements Component {
   private left = "";
   private right = "";
+  private context = "";
 
   setParts(left: string, right: string): void {
     this.left = left;
     this.right = right;
+    this.context = "";
+  }
+
+  setContextUsage(snapshot: ContextUsageSnapshot): void {
+    this.context = formatContextUsage(snapshot);
   }
 
   invalidate(): void {}
@@ -1967,11 +2284,18 @@ class FooterStatus implements Component {
     const leftWidth = visibleWidth(this.left);
     const rightWidth = visibleWidth(this.right);
 
-    if (!this.right || leftWidth + rightWidth + 1 > innerWidth) {
-      return [` ${truncateToWidth(this.left, innerWidth, "")}`];
+    const middle = this.context ? `  ${this.context}` : "";
+    const middleWidth = visibleWidth(middle);
+    const totalWidth = leftWidth + middleWidth + rightWidth;
+
+    if (!this.right || totalWidth + 2 > innerWidth) {
+      const compactLeft = this.context
+        ? `${this.left}${middle}`
+        : this.left;
+      return [` ${truncateToWidth(compactLeft, innerWidth, "")}`];
     }
 
-    const gap = " ".repeat(Math.max(1, innerWidth - leftWidth - rightWidth));
-    return [` ${this.left}${gap}${this.right}`];
+    const gap = " ".repeat(Math.max(1, innerWidth - totalWidth));
+    return [` ${this.left}${middle}${gap}${this.right}`];
   }
 }

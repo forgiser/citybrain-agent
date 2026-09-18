@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getCityBrainDir } from "../auth/auth-storage.js";
-import type { ModelDefinition } from "./model-catalog.js";
+import {
+  applyKnownModelMetadata,
+  type ModelDefinition,
+} from "./model-catalog.js";
 
 interface StoredModelEntry {
   fetchedAt: string;
@@ -22,14 +25,17 @@ export class ModelStore {
   }
 
   read(providerId: string): ModelDefinition[] {
-    return this.load()[providerId]?.models ?? [];
+    return (this.load()[providerId]?.models ?? []).map(applyKnownModelMetadata);
   }
 
   write(providerId: string, models: ModelDefinition[]): void {
     const data = this.load();
     data[providerId] = {
       fetchedAt: new Date().toISOString(),
-      models: models.map((model) => ({ ...model, source: "cache" })),
+      models: models.map((model) => ({
+        ...applyKnownModelMetadata(model),
+        source: "cache",
+      })),
     };
     this.writeFile(data);
   }

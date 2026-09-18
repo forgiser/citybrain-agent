@@ -1,7 +1,7 @@
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { QgisRuntimeInfo } from "./qgis-runtime.js";
@@ -21,6 +21,18 @@ interface QgisProcessOutcome {
   exitCode: number;
   stdout: string;
   stderr: string;
+  durationMs: number;
+}
+
+export interface QgisProgress {
+  elapsedMs: number;
+  stdoutTail: string;
+  stderrTail: string;
+}
+
+export interface QgisCommandOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: QgisProgress) => void;
 }
 
 export interface QgisAlgorithmSummary {
@@ -46,7 +58,11 @@ export interface QgisRunResult {
   results: Record<string, string>;
   /** Values from `results` that look like file paths (algorithm outputs). */
   outputPaths: string[];
+  expectedOutputPaths: string[];
+  missingOutputPaths: string[];
+  durationMs: number;
   stdoutTail: string;
+  stderrTail: string;
 }
 
 // Resolving the direct executable and capturing its environment launches
@@ -99,6 +115,7 @@ export async function executeQgisAlgorithm(
   algorithmId: string,
   parameters: Record<string, string | number | boolean>,
   timeoutMs = QGIS_EXECUTE_TIMEOUT_MS,
+  options: QgisCommandOptions = {},
 ): Promise<QgisRunResult> {
   const entries = Object.entries(parameters).map(([key, value]) => {
     const serialized = typeof value === "string" ? value.trim() : String(value);
@@ -108,11 +125,14 @@ export async function executeQgisAlgorithm(
     return `${key}=${serialized}`;
   });
 
-  const output = await runQgisCommand(
+  const processOutcome = await runQgisCommandOutcome(
     runtime,
     ["run", algorithmId, "--", ...entries],
     timeoutMs,
+    options,
   );
+  const output = processOutcome.stdout;
+  const combinedOutput = [output, processOutcome.stderr].filter(Boolean).join("\n");
 
   const results: string[] = [];
   const resultMap: Record<string, string> = {};
@@ -123,22 +143,46 @@ export async function executeQgisAlgorithm(
     resultMap[key] = value;
     results.push(`${key} = ${value}`);
   }
+  const outputPattern = /^\s*([A-Z][A-Z0-9_]*)\s*:\s*(.+?)\s*$/gmu;
+  for (const match of output.matchAll(outputPattern)) {
+    const key = match[1]!.trim();
+    const value = stripOuterQuotes(match[2]!.trim());
+    if (key === "OUTPUT" || key.startsWith("OUTPUT_")) {
+      resultMap[key] = value;
+      results.push(`${key} = ${value}`);
+    }
+  }
 
-  const outputPaths = Object.values(resultMap).filter((value) => looksLikePath(value));
-  const ok = /error|traceback/giu.test(output) ? false : true;
+  const expectedOutputPaths = Object.entries(parameters)
+    .filter(([key, value]) => /^OUTPUT(?:_|$)/iu.test(key) && typeof value === "string")
+    .map(([, value]) => value as string)
+    .filter((value) => looksLikePath(value));
+  const outputPaths = uniquePaths([
+    ...expectedOutputPaths,
+    ...Object.values(resultMap).filter((value) => looksLikePath(value)),
+  ]);
+  const missingOutputPaths = await findMissingPaths(outputPaths);
+  const ok =
+    !/error|traceback/giu.test(combinedOutput) &&
+    missingOutputPaths.length === 0;
   const stdoutTail = truncateText(output.trim(), 4_000);
+  const stderrTail = truncateText(processOutcome.stderr.trim(), 4_000);
 
   return {
     ok,
-    exitCode: 0,
+    exitCode: processOutcome.exitCode,
     results: resultMap,
     outputPaths,
+    expectedOutputPaths,
+    missingOutputPaths,
+    durationMs: processOutcome.durationMs,
     stdoutTail: [
       results.length > 0 ? `Results:\n  ${results.join("\n  ")}` : "",
       stdoutTail,
     ]
       .filter(Boolean)
       .join("\n\n"),
+    stderrTail,
   };
 }
 
@@ -146,27 +190,49 @@ export async function runQgisCommand(
   runtime: QgisRuntimeInfo,
   args: string[],
   timeoutMs: number,
+  options: QgisCommandOptions = {},
 ): Promise<string> {
+  const outcome = await runQgisCommandOutcome(runtime, args, timeoutMs, options);
+  return outcome.stdout;
+}
+
+async function runQgisCommandOutcome(
+  runtime: QgisRuntimeInfo,
+  args: string[],
+  timeoutMs: number,
+  options: QgisCommandOptions = {},
+): Promise<QgisProcessOutcome> {
   const client = await resolveClientProcess(runtime);
   if (client) {
-    const outcome = await spawnProcess(client.executablePath, args, timeoutMs, client.env);
+    const outcome = await spawnProcess(
+      client.executablePath,
+      args,
+      timeoutMs,
+      client.env,
+      options,
+    );
     if (outcome.exitCode !== 0) {
       throw new Error(
         `qgis_process failed (exit ${outcome.exitCode}): ${truncateText(outcome.stderr || outcome.stdout, 2_000)}`,
       );
     }
-    return outcome.stdout;
+    return outcome;
   }
 
   // Fallback: drive the .bat wrapper through cmd. Values containing spaces
   // are unreliable here (cmd %* quoting), which is why direct-exe is preferred.
-  const outcome = await runThroughBat(runtime.executablePath, args, timeoutMs);
+  const outcome = await runThroughBat(
+    runtime.executablePath,
+    args,
+    timeoutMs,
+    options,
+  );
   if (outcome.exitCode !== 0) {
     throw new Error(
       `qgis_process failed (exit ${outcome.exitCode}): ${truncateText(outcome.stderr || outcome.stdout, 2_000)}`,
     );
   }
-  return outcome.stdout;
+  return outcome;
 }
 
 async function resolveClientProcess(
@@ -275,28 +341,78 @@ function spawnProcess(
   args: string[],
   timeoutMs: number,
   env: NodeJS.ProcessEnv,
+  options: QgisCommandOptions = {},
 ): Promise<QgisProcessOutcome> {
   return new Promise((resolvePromise, reject) => {
-    execFile(
-      command,
-      args,
-      { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024, env },
-      (error, stdout, stderr) => {
-        if (!error) {
-          resolvePromise({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
-          return;
-        }
-        if ((error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-          reject(new Error(`qgis_process timed out after ${Math.round(timeoutMs / 1000)}s.`));
-          return;
-        }
-        resolvePromise({
-          exitCode: typeof error.code === "number" ? error.code : 1,
-          stdout: String(stdout),
-          stderr: String(stderr),
-        });
-      },
-    );
+    const startedAt = Date.now();
+    const child = spawn(command, args, {
+      windowsHide: true,
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let progressTimer: ReturnType<typeof setInterval> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (outcome: QgisProcessOutcome): void => {
+      if (settled) return;
+      settled = true;
+      if (progressTimer) clearInterval(progressTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      options.signal?.removeEventListener("abort", abort);
+      resolvePromise(outcome);
+    };
+
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (progressTimer) clearInterval(progressTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      options.signal?.removeEventListener("abort", abort);
+      reject(error);
+    };
+
+    const abort = (): void => {
+      child.kill();
+      fail(new Error("qgis_process was cancelled."));
+    };
+
+    const emitProgress = (): void => {
+      options.onProgress?.({
+        elapsedMs: Date.now() - startedAt,
+        stdoutTail: truncateText(stdout.trim(), 2_000),
+        stderrTail: truncateText(stderr.trim(), 2_000),
+      });
+    };
+
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      stdout = appendOutput(stdout, String(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      stderr = appendOutput(stderr, String(chunk));
+    });
+    child.once("error", (error) => {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    });
+    child.once("close", (code) => {
+      finish({
+        exitCode: typeof code === "number" ? code : 1,
+        stdout,
+        stderr,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    options.signal?.addEventListener("abort", abort, { once: true });
+    progressTimer = setInterval(emitProgress, 1_000);
+    progressTimer.unref?.();
+    timeoutTimer = setTimeout(() => {
+      child.kill();
+      fail(new Error(`qgis_process timed out after ${Math.round(timeoutMs / 1000)}s.`));
+    }, timeoutMs);
+    timeoutTimer.unref?.();
   });
 }
 
@@ -304,29 +420,15 @@ function runThroughBat(
   batPath: string,
   args: string[],
   timeoutMs: number,
+  options: QgisCommandOptions = {},
 ): Promise<QgisProcessOutcome> {
-  return new Promise((resolvePromise, reject) => {
-    execFile(
-      process.env.ComSpec || "cmd.exe",
-      ["/d", "/c", "call", batPath, ...args],
-      { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        if (!error) {
-          resolvePromise({ exitCode: 0, stdout: String(stdout), stderr: String(stderr) });
-          return;
-        }
-        if ((error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-          reject(new Error(`qgis_process timed out after ${Math.round(timeoutMs / 1000)}s.`));
-          return;
-        }
-        resolvePromise({
-          exitCode: typeof error.code === "number" ? error.code : 1,
-          stdout: String(stdout),
-          stderr: String(stderr),
-        });
-      },
-    );
-  });
+  return spawnProcess(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/c", "call", batPath, ...args],
+    timeoutMs,
+    process.env,
+    options,
+  );
 }
 
 function flattenAlgorithmCatalog(parsed: unknown): QgisAlgorithmSummary[] {
@@ -434,6 +536,42 @@ function parseJsonOutput(output: string): unknown {
 
 function looksLikePath(value: string): boolean {
   return /^[a-zA-Z]:[\\/]/u.test(value) || value.startsWith("/");
+}
+
+function stripOuterQuotes(value: string): string {
+  return value.replace(/^["']|["']$/gu, "");
+}
+
+function uniquePaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const path of paths) {
+    const cleaned = stripOuterQuotes(path.trim());
+    if (!cleaned || seen.has(cleaned.toLowerCase())) continue;
+    seen.add(cleaned.toLowerCase());
+    output.push(cleaned);
+  }
+  return output;
+}
+
+async function findMissingPaths(paths: string[]): Promise<string[]> {
+  const missing: string[] = [];
+  for (const path of paths) {
+    try {
+      await stat(path);
+    } catch {
+      missing.push(path);
+    }
+  }
+  return missing;
+}
+
+function appendOutput(current: string, chunk: string): string {
+  const combined = current + chunk;
+  const maxLength = 16 * 1024 * 1024;
+  return combined.length <= maxLength
+    ? combined
+    : combined.slice(combined.length - maxLength);
 }
 
 function truncateText(text: string, maxLength: number): string {

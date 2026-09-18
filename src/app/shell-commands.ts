@@ -38,6 +38,11 @@ export const shellCommands: ShellCommand[] = [
     argumentHint: "[setup|detect|list [filter]|info <algo>|use <path>|clear]",
   },
   {
+    name: "/init",
+    description: "初始化 CityBrain 项目工作区（citybrain/ 目录骨架）",
+    argumentHint: "[<target-folder>]",
+  },
+  {
     name: "/login",
     description: "保存一个供应商 API密钥",
     argumentHint: "<provider>",

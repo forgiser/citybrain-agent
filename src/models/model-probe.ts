@@ -1,5 +1,8 @@
 import type { ApiKeyCredential } from "../auth/auth-storage.js";
-import type { ModelDefinition } from "./model-catalog.js";
+import {
+  applyKnownModelMetadata,
+  type ModelDefinition,
+} from "./model-catalog.js";
 
 export interface ModelProbeOptions {
   fetchImpl?: typeof fetch;
@@ -132,14 +135,14 @@ function parseOpenAiModels(provider: string, payload: unknown): ModelDefinition[
     .filter(isTextModel)
     .map((record) => {
       const id = getModelId(record);
-      return {
+      return applyKnownModelMetadata({
         provider,
         id,
         name: getString(record.name) ?? id,
         description: getString(record.description) ?? `Model returned by ${provider}`,
         ...getContextWindowField(record),
         source: "provider_probe" as const,
-      };
+      });
     })
     .filter((model) => model.id.length > 0);
 }
@@ -148,14 +151,14 @@ function parseAnthropicModels(provider: string, payload: unknown): ModelDefiniti
   return getRecords(payload)
     .map((record) => {
       const id = getModelId(record);
-      return {
+      return applyKnownModelMetadata({
         provider,
         id,
         name: getString(record.display_name) ?? id,
         description: `Anthropic model${record.created_at ? ` (${String(record.created_at)})` : ""}`,
         ...getContextWindowField(record),
         source: "provider_probe" as const,
-      };
+      });
     })
     .filter((model) => model.id.length > 0);
 }
@@ -171,14 +174,14 @@ function parseGoogleModels(provider: string, payload: unknown): ModelDefinition[
     .map((record) => {
       const rawName = getString(record.name) ?? "";
       const id = rawName.startsWith("models/") ? rawName.slice("models/".length) : rawName;
-      return {
+      return applyKnownModelMetadata({
         provider,
         id,
         name: getString(record.displayName) ?? id,
         description: getString(record.description) ?? "Model returned by Google Gemini",
         ...getContextWindowField(record),
         source: "provider_probe" as const,
-      };
+      });
     })
     .filter((model) => model.id.length > 0);
 }
@@ -188,14 +191,14 @@ function parseOpenRouterModels(provider: string, payload: unknown): ModelDefinit
     .filter(isTextModel)
     .map((record) => {
       const id = getModelId(record);
-      return {
+      return applyKnownModelMetadata({
         provider,
         id,
         name: getString(record.name) ?? id,
         description: getString(record.description) ?? "Model returned by OpenRouter",
         ...getContextWindowField(record),
         source: "provider_probe" as const,
-      };
+      });
     })
     .filter((model) => model.id.length > 0);
 }
