@@ -15,7 +15,8 @@ const CONTEXT_WINDOW_CEILING = 1_000_000;
 export const COMPACT_BUFFER_TOKENS = 13_000;
 
 /** Models whose ids match are known to exceed the default window. */
-const LARGE_WINDOW_PATTERN = /\[1m\]|1m\b|claude-sonnet-4|opus-4|gemini-2\.0-pro|x-/iu;
+const LARGE_WINDOW_PATTERN =
+  /\[1m\]|1m\b|deepseek-(?:flash|v4)|claude-sonnet-4|opus-4|gemini-2\.0-pro|x-/iu;
 
 /**
  * Resolve the effective context window for a model id. Falls back to the

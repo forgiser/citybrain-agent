@@ -193,6 +193,12 @@ export async function startInteractiveApp(): Promise<void> {
     toolLogger,
     contextLogger,
     contextTraceLogger,
+    () => ({
+      qgisRuntimeSummary: qgisRuntime
+        ? `${qgisRuntime.version} (${qgisRuntime.executablePath})`
+        : undefined,
+      artifactSummary: formatArtifactSummary(toolRegistry.artifacts.snapshot()),
+    }),
   );
   const terminal = new ProcessTerminal();
   const tui: TUI = new TuiMainScreen(terminal, true);
@@ -2298,4 +2304,22 @@ class FooterStatus implements Component {
     const gap = " ".repeat(Math.max(1, innerWidth - totalWidth));
     return [` ${this.left}${middle}${gap}${this.right}`];
   }
+}
+
+function formatArtifactSummary(
+  records: Array<{
+    path: string;
+    status: string;
+    producerTaskId: string;
+    error?: string;
+  }>,
+): string | undefined {
+  if (records.length === 0) return undefined;
+  return records
+    .slice(-20)
+    .map((record) => {
+      const error = record.error ? `: ${record.error}` : "";
+      return `- ${record.status} ${record.path} (task ${record.producerTaskId})${error}`;
+    })
+    .join("\n");
 }

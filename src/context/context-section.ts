@@ -2,10 +2,10 @@
  * Named system-prompt section registry, mirroring Claude Code 2's
  * `systemPromptSection` / `resolveSystemPromptSections`.
  *
- * Every dynamic block of the system prompt is a named, memoized section. The
- * name doubles as the cache key: a section is computed once and reused until
- * its cache is cleared (on /clear or /compact), so the session's static prefix
- * stays byte-identical and the prompt-cache prefix stays stable.
+ * Every block of the system prompt is named. Stable sections may be memoized
+ * by name; volatile sections are recomputed for every request. This keeps the
+ * static prefix byte-identical without allowing project state or task progress
+ * to become stale.
  *
  * Two kinds:
  *  - `systemPromptSection(name, compute)`     — cached, stable across turns
@@ -44,7 +44,7 @@ export function volatileSystemPromptSection(
   return { name, compute, cacheBreak: true, reason };
 }
 
-/** Session-scoped section cache shared across the context layer. */
+/** Process-scoped cache for stable sections. Volatile sections bypass it. */
 const sectionCache = new Map<string, string | null>();
 
 /**

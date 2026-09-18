@@ -1,6 +1,7 @@
 import { readMemoryIndex, readProjectInstruction, readSkillsIndex } from "./context-store.js";
 import {
   systemPromptSection,
+  volatileSystemPromptSection,
   type SystemPromptSection,
 } from "./context-section.js";
 import type { ContextBuildInputs, SystemContextParts } from "./context-types.js";
@@ -49,6 +50,7 @@ export function buildSystemSections(
   return [
     ...buildStaticSections(inputs),
     ...buildDynamicSections(cwd, inputs),
+    ...buildVolatileSections(cwd, inputs),
   ];
 }
 
@@ -121,19 +123,72 @@ export function buildDynamicSections(
   inputs: ContextBuildInputs,
 ): SystemPromptSection[] {
   return [
-    systemPromptSection("project_instruction", () =>
+    volatileSystemPromptSection("project_instruction", () =>
       formatOptional(
         "Project instruction",
         inputs.projectInstructionPath
           ? readProjectInstruction(inputs.projectInstructionPath)
           : readProjectInstruction(cwd),
       ),
+      "project instructions may change during a session",
     ),
-    systemPromptSection("memory_index", () =>
+    volatileSystemPromptSection("memory_index", () =>
       formatOptional("Persistent memory index", inputs.memoryIndex ?? readMemoryIndex()),
+      "persistent memory may be updated by another run",
     ),
-    systemPromptSection("skills_index", () =>
+    volatileSystemPromptSection("skills_index", () =>
       formatOptional("Reusable QGIS runbook index", inputs.skillsIndex ?? readSkillsIndex()),
+      "runbooks may be updated while the CLI is running",
+    ),
+  ];
+}
+
+/**
+ * Rebuild working state before every model request. These blocks are kept
+ * separate from the static prompt so a long-running QGIS task can change the
+ * live context without changing the stable identity and behavior prefix.
+ */
+export function buildVolatileSections(
+  cwd: string,
+  inputs: ContextBuildInputs,
+): SystemPromptSection[] {
+  return [
+    volatileSystemPromptSection(
+      "analysis_task",
+      () => formatOptional("Current analysis task", inputs.analysisTask),
+      "the task ledger changes as work progresses",
+    ),
+    volatileSystemPromptSection(
+      "qgis_runtime",
+      () =>
+        inputs.qgisRuntimeSummary
+          ? `QGIS runtime: ${inputs.qgisRuntimeSummary}`
+          : "QGIS runtime: not configured; QGIS processing tools may be unavailable.",
+      "the configured processing runtime can change during a session",
+    ),
+    volatileSystemPromptSection(
+      "artifact_state",
+      () =>
+        inputs.artifactSummary
+          ? `Tracked artifacts:\n${inputs.artifactSummary}`
+          : "Tracked artifacts: none.",
+      "tool outputs change as processing tasks settle",
+    ),
+    volatileSystemPromptSection(
+      "working_directories",
+      () => {
+        const directories = [cwd, ...(inputs.additionalWorkingDirectories ?? [])]
+          .filter((value, index, values) => value && values.indexOf(value) === index);
+        return directories.length > 0
+          ? `Working directories:\n${directories.map((value) => `- ${value}`).join("\n")}`
+          : null;
+      },
+      "the active session working directory can change",
+    ),
+    volatileSystemPromptSection(
+      "today",
+      () => `Today's date: ${inputs.today ?? realToday()}`,
+      "date-sensitive reasoning must use the current request date",
     ),
   ];
 }
@@ -184,8 +239,28 @@ function buildStateBlocks(
 ): Record<string, string> {
   const blocks: Record<string, string> = {};
 
+  if (inputs.analysisTask) {
+    blocks["analysis_task"] = formatIndexBlock(
+      "Current analysis task",
+      inputs.analysisTask,
+    );
+  }
+
   if (inputs.qgisRuntimeSummary) {
     blocks["qgis_runtime"] = `QGIS runtime: ${inputs.qgisRuntimeSummary}`;
+  }
+
+  if (inputs.artifactSummary) {
+    blocks["artifact_state"] = `Tracked artifacts:\n${inputs.artifactSummary}`;
+  }
+
+  const directories = [cwd, ...(inputs.additionalWorkingDirectories ?? [])]
+    .filter((value, index, values) => value && values.indexOf(value) === index);
+  if (directories.length > 0) {
+    blocks["working_directories"] = [
+      "Working directories:",
+      ...directories.map((value) => `- ${value}`),
+    ].join("\n");
   }
 
   blocks["today"] = `Today's date: ${inputs.today ?? realToday()}`;

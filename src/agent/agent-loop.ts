@@ -8,7 +8,11 @@ import {
   type ModelUsage,
   type StreamChatOptions,
 } from "../models/model-chat.js";
-import { buildSystemPromptForCwd } from "../context/index.js";
+import {
+  buildSystemPromptForCwd,
+  readAnalysisTask,
+  type ContextBuildInputs,
+} from "../context/index.js";
 import { ModelRuntime } from "../models/model-runtime.js";
 import {
   DEFAULT_CONTEXT_WINDOW,
@@ -16,10 +20,9 @@ import {
 } from "../session/session-manager.js";
 import {
   createEstimatedUsageSnapshot,
-  createHybridUsageSnapshot,
   createProviderUsageSnapshot,
   estimateChatContextTokens,
-  getContextTokensFromUsage,
+  getPromptTokensFromUsage,
   type ContextUsageSnapshot,
 } from "../context/context-usage.js";
 import { ContextUsageLogger } from "../context/context-usage-log.js";
@@ -88,6 +91,7 @@ export class AgentLoop {
     private readonly logger?: ToolExecutionLogger,
     private readonly contextLogger?: ContextUsageLogger,
     private readonly contextTraceLogger?: ContextTraceLogger,
+    private readonly getContextInputs?: () => ContextBuildInputs,
   ) {}
 
   getSelectedModel(): ModelDefinition | undefined {
@@ -107,7 +111,6 @@ export class AgentLoop {
     let lastToolBatchSignature = "";
     let identicalToolBatchCount = 0;
     let requestIndex = 0;
-    let measuredMessageCount: number | undefined;
     const toolHistory: Array<{ name: string; ok: boolean }> = [];
 
     const transition = (
@@ -152,16 +155,17 @@ export class AgentLoop {
         throw new Error("Provider is not logged in: " + model.provider);
       }
 
-      const systemPrompt = await buildSystemPromptForCwd(this.session.getCwd());
-      let messages: ChatMessage[] = [
-        { role: "system", content: systemPrompt },
+      // Keep the canonical conversation separate from the system prompt.
+      // The provider receives a combined request snapshot, but the agent
+      // state never treats system instructions as ordinary conversation.
+      let conversationMessages: ChatMessage[] = [
         ...this.session.getContextMessages(),
       ];
       const userMessage = {
         role: "user",
         content: input,
       } as const;
-      messages.push(userMessage);
+      conversationMessages.push(userMessage);
       this.session.appendMessage(userMessage);
 
       let finalResponse = "";
@@ -173,6 +177,21 @@ export class AgentLoop {
         : "fallback";
 
       while (true) {
+        const contextInputs = this.getContextInputs?.() ?? {};
+        const systemPrompt = await buildSystemPromptForCwd(
+          this.session.getCwd(),
+          {
+            ...contextInputs,
+            analysisTask:
+              contextInputs.analysisTask ??
+              readAnalysisTask(this.session.getCwd()),
+          },
+        );
+        let requestMessages: ChatMessage[] = [
+          { role: "system", content: systemPrompt },
+          ...conversationMessages,
+        ];
+
         if (finalizationRequested) {
           yield transition("finalizing", finalizationReason);
         }
@@ -207,17 +226,17 @@ export class AgentLoop {
         );
         if (compaction) {
           latestUsage = undefined;
-          measuredMessageCount = undefined;
-          messages = [
+          conversationMessages = this.session.getContextMessages();
+          requestMessages = [
             { role: "system", content: systemPrompt },
-            ...this.session.getContextMessages(),
+            ...conversationMessages,
           ];
           const compactedSnapshot = createEstimatedUsageSnapshot(
             {
               ...contextBase,
               stage: "before_request",
             },
-            estimateChatContextTokens(messages, availableTools),
+            estimateChatContextTokens(requestMessages, availableTools),
           );
           void this.contextTraceLogger?.recordCompaction(
             compactedSnapshot,
@@ -226,35 +245,25 @@ export class AgentLoop {
           );
           yield publishContext(compactedSnapshot);
         }
-        const beforeRequestSnapshot =
-          latestUsage && measuredMessageCount !== undefined
-            ? createHybridUsageSnapshot(
-                {
-                  ...contextBase,
-                  stage: "before_request",
-                },
-                latestUsage,
-                estimateChatContextTokens(
-                  messages.slice(measuredMessageCount),
-                  [],
-                ),
-              )
-            : createEstimatedUsageSnapshot(
-                {
-                  ...contextBase,
-                  stage: "before_request",
-                },
-                estimateChatContextTokens(messages, availableTools),
-              );
+        // The previous provider usage belongs to the previous request. Since
+        // the volatile system prompt may have changed, estimate this complete
+        // request instead of blindly adding a trailing-message delta.
+        const beforeRequestSnapshot = createEstimatedUsageSnapshot(
+          {
+            ...contextBase,
+            stage: "before_request",
+          },
+          estimateChatContextTokens(requestMessages, availableTools),
+        );
         yield publishContext(beforeRequestSnapshot);
         void this.contextTraceLogger?.recordRequest(
           beforeRequestSnapshot,
-          messages,
+          requestMessages,
           availableTools,
         );
         let usageForCall: ModelUsage | undefined;
 
-        for await (const delta of streamModelChat(model, credential, messages, {
+        for await (const delta of streamModelChat(model, credential, requestMessages, {
           ...options,
           tools: availableTools,
           onUsage: (nextUsage) => {
@@ -287,7 +296,7 @@ export class AgentLoop {
           toolCalls.set(toolCall.index, existing);
         }
 
-        if (usageForCall && getContextTokensFromUsage(usageForCall) > 0) {
+        if (usageForCall && getPromptTokensFromUsage(usageForCall) > 0) {
           const responseSnapshot = createProviderUsageSnapshot(
             {
               ...contextBase,
@@ -298,23 +307,21 @@ export class AgentLoop {
           yield publishContext(responseSnapshot);
           void this.contextTraceLogger?.recordResponse(
             responseSnapshot,
-            messages,
+            requestMessages,
           );
-          measuredMessageCount = messages.length;
         } else {
           const responseSnapshot = createEstimatedUsageSnapshot(
             {
               ...contextBase,
               stage: "after_response",
             },
-            estimateChatContextTokens(messages, availableTools),
+            estimateChatContextTokens(requestMessages, availableTools),
           );
           yield publishContext(responseSnapshot);
           void this.contextTraceLogger?.recordResponse(
             responseSnapshot,
-            messages,
+            requestMessages,
           );
-          measuredMessageCount = undefined;
         }
 
         finalThinking += thinking;
@@ -325,7 +332,10 @@ export class AgentLoop {
           } else if (!finalizationRequested) {
             finalizationRequested = true;
             finalizationReason = "model returned no final text";
-            messages.push({ role: "user", content: FINALIZATION_INSTRUCTION });
+            conversationMessages.push({
+              role: "user",
+              content: FINALIZATION_INSTRUCTION,
+            });
             turn += 1;
             continue;
           } else {
@@ -349,7 +359,7 @@ export class AgentLoop {
 
         finalizationReason = "";
         const resolvedToolCalls = [...toolCalls.values()];
-        messages.push({
+        conversationMessages.push({
           role: "assistant",
           content: response,
           toolCalls: resolvedToolCalls,
@@ -389,7 +399,7 @@ export class AgentLoop {
           const outcome = outcomes[index]!;
           const toolCall = resolvedToolCalls[index]!;
           toolHistory.push({ name: toolCall.name, ok: outcome.ok });
-          messages.push({
+          conversationMessages.push({
             role: "tool",
             content: outcome.content,
             toolCallId: toolCall.id,
@@ -408,11 +418,17 @@ export class AgentLoop {
         if (toolTurnCount >= MAX_TOOL_TURNS) {
           finalizationRequested = true;
           finalizationReason = `tool safety limit reached (${MAX_TOOL_TURNS} turns)`;
-          messages.push({ role: "user", content: FINALIZATION_INSTRUCTION });
+          conversationMessages.push({
+            role: "user",
+            content: FINALIZATION_INSTRUCTION,
+          });
         } else if (identicalToolBatchCount >= MAX_IDENTICAL_TOOL_BATCHES) {
           finalizationRequested = true;
           finalizationReason = "the same tool batch repeated without progress";
-          messages.push({ role: "user", content: FINALIZATION_INSTRUCTION });
+          conversationMessages.push({
+            role: "user",
+            content: FINALIZATION_INSTRUCTION,
+          });
         }
       }
 

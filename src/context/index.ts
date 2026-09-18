@@ -7,6 +7,7 @@ export {
   buildContext,
   buildDynamicSections,
   buildStaticSections,
+  buildVolatileSections,
   buildSystemSections,
   DEFAULT_QB_ROLE_PROMPT,
 } from "./context-builder.js";
@@ -14,6 +15,7 @@ export {
   buildSystemPromptForCwd,
   flattenSystemPrompt,
   SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+  SYSTEM_PROMPT_VOLATILE_BOUNDARY,
 } from "./context-assembly.js";
 export {
   clearSystemPromptSections,

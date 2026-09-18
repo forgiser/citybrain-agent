@@ -121,6 +121,16 @@ export function createSubagentTool(
         childTools,
         deps.toolLogger,
         deps.contextLogger,
+        undefined,
+        () => {
+          const runtime = deps.getQgisRuntime();
+          return {
+            qgisRuntimeSummary: runtime
+              ? `${runtime.version} (${runtime.executablePath})`
+              : undefined,
+            artifactSummary: formatArtifactSummary(childTools.artifacts.snapshot()),
+          };
+        },
       );
 
       // Surface the subagent's token usage up as it streams, so the UI can
@@ -161,4 +171,22 @@ export function createSubagentTool(
     // Nested agent runs are heavy and share model/auth state; run exclusively.
     isConcurrencySafe: () => false,
   };
+}
+
+function formatArtifactSummary(
+  records: Array<{
+    path: string;
+    status: string;
+    producerTaskId: string;
+    error?: string;
+  }>,
+): string | undefined {
+  if (records.length === 0) return undefined;
+  return records
+    .slice(-20)
+    .map((record) => {
+      const error = record.error ? `: ${record.error}` : "";
+      return `- ${record.status} ${record.path} (task ${record.producerTaskId})${error}`;
+    })
+    .join("\n");
 }

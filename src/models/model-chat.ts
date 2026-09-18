@@ -668,12 +668,17 @@ function readGoogleUsage(event: unknown): ModelUsage | undefined {
   }
 
   const usage = event.usageMetadata;
-  const input = getNumber(usage.promptTokenCount);
+  const promptTokens = getNumber(usage.promptTokenCount);
   const output =
     getNumber(usage.candidatesTokenCount) ||
     getNumber(usage.candidateTokenCount);
   const cacheRead = getNumber(usage.cachedContentTokenCount);
-  const totalTokens = getNumber(usage.totalTokenCount) || input + output + cacheRead;
+  // Gemini's promptTokenCount already includes cached content. Normalize the
+  // same way as the OpenAI-compatible and Anthropic adapters so promptTokens
+  // does not double-count cacheRead.
+  const input = Math.max(0, promptTokens - cacheRead);
+  const totalTokens =
+    getNumber(usage.totalTokenCount) || input + output + cacheRead;
 
   if (totalTokens <= 0) {
     return undefined;

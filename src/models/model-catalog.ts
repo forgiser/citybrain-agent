@@ -25,17 +25,19 @@ const KNOWN_CONTEXT_WINDOWS: readonly {
 ];
 
 export function applyKnownModelMetadata(model: ModelDefinition): ModelDefinition {
-  if (model.contextWindow && model.contextWindow > 0) {
-    return model;
-  }
-
   const known = KNOWN_CONTEXT_WINDOWS.find(
     (candidate) =>
       candidate.provider === model.provider && candidate.matches.test(model.id),
   );
-  return known
-    ? { ...model, contextWindow: known.contextWindow }
-    : model;
+  if (!known) return model;
+
+  // Provider model-list endpoints have been observed to report a generic
+  // 128k limit for DeepSeek models whose actual input window is 1M. Prefer
+  // the curated capability when it is larger than provider metadata.
+  if (!model.contextWindow || model.contextWindow < known.contextWindow) {
+    return { ...model, contextWindow: known.contextWindow };
+  }
+  return model;
 }
 
 export function getModelReference(model: ModelDefinition): string {

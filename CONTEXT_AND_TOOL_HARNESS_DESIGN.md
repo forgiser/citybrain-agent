@@ -884,6 +884,16 @@ requestTotalTokens
 - 修正 prompt token 与 total token 的口径；
 - 修正上下文窗口的来源优先级。
 
+当前实现进度：
+
+- 已完成 AgentLoop 内部的 `conversationMessages` / `requestMessages` 分离；
+- 已完成每次模型请求前刷新 project instruction、memory、skills、当前任务、QGIS runtime、工作目录和日期；
+- 已完成 static / dynamic / volatile 边界标记，并在 `context-trace.jsonl` 记录三段文本及估算 token；
+- 已完成 provider prompt token、completion token、request total token 的分开记录；
+- 已完成 DeepSeek V4 可信 1M context window 覆盖较小 provider 元数据；
+- 已完成将当前 QGIS/tool artifact 的 `pending/ready/missing/invalid` 状态摘要注入 volatile context；
+- 工具结果预算、结果落盘策略与独立 `StreamingToolExecutor` 仍待后续阶段实现。
+
 主要文件：
 
 ```text

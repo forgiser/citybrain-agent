@@ -47,6 +47,8 @@ export interface ContextBuildInputs {
   skillsIndex?: string;
   /** Ready-to-run QGIS runtime summary line, when configured. */
   qgisRuntimeSummary?: string;
+  /** Compact summary of tracked tool/QGIS artifacts. */
+  artifactSummary?: string;
   /** Absolute paths the agent is rooted in (for workspace awareness). */
   additionalWorkingDirectories?: string[];
   /** Today's date string, injected as `Today's date: <date>`. */

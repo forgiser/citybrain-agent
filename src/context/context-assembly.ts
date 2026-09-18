@@ -2,6 +2,7 @@ import {
   buildContext,
   buildDynamicSections,
   buildStaticSections,
+  buildVolatileSections,
 } from "./context-builder.js";
 import { resolveSystemPromptSections } from "./context-section.js";
 import type {
@@ -18,6 +19,8 @@ import type {
  */
 export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY =
   "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+export const SYSTEM_PROMPT_VOLATILE_BOUNDARY =
+  "__SYSTEM_PROMPT_VOLATILE_BOUNDARY__";
 
 /**
  * Flatten the three context-part dictionaries into a single system-prompt
@@ -59,15 +62,24 @@ export async function buildSystemPromptForCwd(
   cwd: string,
   inputs: ContextBuildInputs = {},
 ): Promise<string> {
-  const [staticParts, dynamicParts] = await Promise.all([
+  const [staticParts, dynamicParts, volatileParts] = await Promise.all([
     resolveSystemPromptSections(buildStaticSections(inputs)),
     resolveSystemPromptSections(buildDynamicSections(cwd, inputs)),
+    resolveSystemPromptSections(buildVolatileSections(cwd, inputs)),
   ]);
   const joinParts = (list: (string | null)[]): string =>
     list.filter((s): s is string => s !== null).join("\n\n");
   const staticBase = joinParts(staticParts);
   const dynamicBase = joinParts(dynamicParts);
-  if (!staticBase) return dynamicBase;
-  if (!dynamicBase) return staticBase;
-  return `${staticBase}\n\n${SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n\n${dynamicBase}`;
+  const volatileBase = joinParts(volatileParts);
+  const dynamicSections = [
+    dynamicBase,
+    volatileBase
+      ? `${SYSTEM_PROMPT_VOLATILE_BOUNDARY}\n\n${volatileBase}`
+      : "",
+  ].filter(Boolean);
+  const dynamicPrompt = dynamicSections.join("\n\n");
+  if (!staticBase) return dynamicPrompt;
+  if (!dynamicPrompt) return staticBase;
+  return `${staticBase}\n\n${SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n\n${dynamicPrompt}`;
 }
