@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "workspaceRoot": "E:\\Geo-agent\\citybrain",
+  "projectDir": "E:\\Geo-agent",
+  "mode": "analysis",
+  "readRoots": [
+    "E:\\Geo-agent\\citybrain",
+    "E:\\Geo-agent"
+  ],
+  "createdAt": "2026-09-19T01:36:15.161Z",
+  "updatedAt": "2026-09-19T01:38:16.595Z"
+}
