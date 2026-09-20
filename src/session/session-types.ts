@@ -53,7 +53,22 @@ export interface CompactionEntry extends SessionEntryBase {
   reason: string;
 }
 
-export type SessionEntry = SessionMessageEntry | ModelChangeEntry | CompactionEntry;
+export interface ContextReplacementEntry extends SessionEntryBase {
+  type: "context_replacement";
+  toolCallId: string;
+  toolName?: string;
+  path: string;
+  replacement: string;
+  originalCharacters: number;
+  originalTokens: number;
+  projectedTokens: number;
+}
+
+export type SessionEntry =
+  | SessionMessageEntry
+  | ModelChangeEntry
+  | CompactionEntry
+  | ContextReplacementEntry;
 export type SessionFileEntry = SessionHeader | SessionEntry;
 
 export interface SessionInfo {

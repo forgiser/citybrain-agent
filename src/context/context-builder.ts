@@ -96,6 +96,8 @@ function getToolSemantics(): string {
     "qgis run     — execute a full processing workflow, feeding earlier outputs to later steps.",
     "list_files   — list files/directories under a directory (optionally filtered by glob).",
     "read_file    — read a file by absolute path when you need its raw content.",
+    "write_file   — create or completely rewrite a workspace text file; read existing files first.",
+    "edit_file    — replace an exact unique string in a workspace text file; read it first.",
     "Concurrency-safe tools may run in parallel; steps that depend on each other run sequentially.",
   ].join("\n");
 }

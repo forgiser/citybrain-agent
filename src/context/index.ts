@@ -58,6 +58,30 @@ export {
   estimateMessages,
   type CompactionPlan,
 } from "./context-compaction.js";
+export {
+  compressContextMessages,
+  type ContextCompressionOptions,
+  type ContextCompressionReport,
+  type ContextCompressionResult,
+  type ContextCompressionStage,
+  type ContextCompressionStageName,
+} from "./context-compression.js";
+export {
+  DEFAULT_TOOL_RESULT_BUDGETS,
+  createContextProjectionState,
+  projectContextMessages,
+  restoreContextProjectionState,
+  type ContextProjectionReport,
+  type ContextProjectionResult,
+  type ContextProjectionStage,
+  type ContextProjectionState,
+  type PersistedToolResultProjection,
+  type ToolResultBudget,
+} from "./context-projection.js";
+export {
+  persistToolResult,
+  type StoredToolResult,
+} from "./tool-result-store.js";
 export type {
   ContextBlock,
   ContextBlocks,

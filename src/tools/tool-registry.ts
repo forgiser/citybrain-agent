@@ -9,6 +9,8 @@ import {
   ToolExecutionLogger,
   type ToolExecutionLogContext,
 } from "./tool-execution-log.js";
+import type { SandboxPolicy } from "../workspace/sandbox-policy.js";
+import type { FileReadSnapshot } from "./file-write-utils.js";
 
 /** Per-call context handed to a tool handler so it can stream live events up. */
 export interface ToolCallContext {
@@ -25,6 +27,9 @@ export interface ToolCallContext {
   registerArtifacts?: (paths: string[]) => ArtifactRecord[];
   markArtifactsReady?: (paths: string[]) => ArtifactRecord[];
   markArtifactsMissing?: (paths: string[], error?: string) => ArtifactRecord[];
+  sandbox?: SandboxPolicy;
+  recordFileRead?: (snapshot: FileReadSnapshot) => void;
+  getFileReadSnapshot?: (path: string) => FileReadSnapshot | undefined;
 }
 
 export type ToolTaskStatus = "completed" | "failed";
@@ -49,11 +54,12 @@ export interface ToolRegistrationOptions {
    * side effects or ordering dependencies — they execute exclusively.
    */
   isConcurrencySafe?: (args: unknown) => boolean;
-  producesArtifacts?: (args: unknown) => string[];
+  producesArtifacts?: (args: unknown, context?: ToolCallContext) => string[];
 }
 
 export interface ToolRegistryOptions {
   logger?: ToolExecutionLogger;
+  sandbox?: () => SandboxPolicy;
 }
 
 export interface ToolExecutionOutcome {
@@ -67,7 +73,7 @@ interface RegisteredTool {
   definition: ChatToolDefinition;
   handler: ToolHandler;
   isConcurrencySafe?: (args: unknown) => boolean;
-  producesArtifacts?: (args: unknown) => string[];
+  producesArtifacts?: (args: unknown, context?: ToolCallContext) => string[];
 }
 
 /**
@@ -77,6 +83,7 @@ interface RegisteredTool {
  */
 export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
+  private readonly fileReadSnapshots = new Map<string, FileReadSnapshot>();
   readonly artifacts: ArtifactRegistry;
 
   constructor(
@@ -159,6 +166,12 @@ export class ToolRegistry {
       taskId,
       signal: context?.signal ?? new AbortController().signal,
       artifacts: this.artifacts,
+      sandbox: context?.sandbox ?? this.options.sandbox?.(),
+      recordFileRead: (snapshot) => {
+        this.fileReadSnapshots.set(normalizePath(snapshot.path), snapshot);
+      },
+      getFileReadSnapshot: (path) =>
+        this.fileReadSnapshots.get(normalizePath(path)),
       emitProgress,
       registerArtifacts: (paths) => {
         const records = this.artifacts.registerPending(paths, taskId);
@@ -237,7 +250,34 @@ export class ToolRegistry {
       return { ok: false, content, taskId, status: "failed" };
     }
 
-    const producedArtifacts = tool?.producesArtifacts?.(args) ?? [];
+    await this.options.logger?.record(
+      ToolExecutionLogger.createStartEvent(
+        executionId,
+        name,
+        argumentsText,
+        args,
+        logContext,
+      ),
+    );
+
+    let producedArtifacts: string[] = [];
+    try {
+      producedArtifacts = tool?.producesArtifacts?.(args, executionContext) ?? [];
+    } catch (error) {
+      const content = `Tool error: ${error instanceof Error ? error.message : String(error)}`;
+      await this.options.logger?.record(
+        ToolExecutionLogger.createFinishEvent(
+          executionId,
+          name,
+          false,
+          Date.now() - startedAt,
+          content,
+          logContext,
+          "failed",
+        ),
+      );
+      return { ok: false, content, taskId, status: "failed" };
+    }
     if (producedArtifacts.length > 0) {
       this.artifacts.registerPending(producedArtifacts, taskId);
       void this.options.logger?.record(
@@ -250,16 +290,6 @@ export class ToolRegistry {
         ),
       );
     }
-
-    await this.options.logger?.record(
-      ToolExecutionLogger.createStartEvent(
-        executionId,
-        name,
-        argumentsText,
-        args,
-        logContext,
-      ),
-    );
 
     if (!tool) {
       const content = `Tool error: unknown tool "${name}".`;
@@ -334,6 +364,10 @@ export class ToolRegistry {
       return { ok: false, content, taskId, status: "failed" };
     }
   }
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/[\\/]+/gu, "\\").toLowerCase();
 }
 
 function parseToolArguments(argumentsText: string): unknown {

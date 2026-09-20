@@ -7,10 +7,13 @@ import type { QgisRuntimeInfo } from "../qgis/qgis-runtime.js";
 import { createQgisTools, type QgisTool } from "../qgis/qgis-tools.js";
 import { executeReadFile, readFileToolDefinition } from "./read-file.js";
 import { executeListFiles, listFilesToolDefinition } from "./list-files.js";
+import { executeWriteFile, writeFileToolDefinition } from "./write-file.js";
+import { editFileToolDefinition, executeEditFile } from "./edit-file.js";
 import { ContextUsageLogger } from "../context/context-usage-log.js";
 import { ToolExecutionLogger } from "./tool-execution-log.js";
 import type { ToolCallContext } from "./tool-registry.js";
 import { ToolRegistry } from "./tool-registry.js";
+import type { SandboxPolicy } from "../workspace/sandbox-policy.js";
 
 /**
  * Dependencies the delegate tool needs to spawn an isolated subagent loop. The
@@ -23,6 +26,7 @@ export interface SubagentToolDeps {
   modelRuntime: ModelRuntime;
   authStorage: AuthStorage;
   getCwd: () => string;
+  getSandboxPolicy?: () => SandboxPolicy;
   /** Shared QGIS runtime getter — deferred so a /qgis runtime change applies to new subagents too. */
   getQgisRuntime: () => QgisRuntimeInfo | undefined;
   toolLogger?: ToolExecutionLogger;
@@ -39,7 +43,8 @@ export const subagentToolDefinition: ChatToolDefinition = {
       "Delegate a self-contained sub-task to a subagent running in an isolated " +
       "context. The subagent cannot see this conversation's history; you must " +
       "brief it completely in `prompt` (what you're trying to do, what's already " +
-      "known, what to report). It has access to QGIS tools, list_files, and read_file, and " +
+      "known, what to report). It has access to QGIS tools, list_files, read_file, " +
+      "write_file, and edit_file. " +
       "cannot delegate further. It returns a single text result when done.",
     parameters: {
       type: "object",
@@ -76,7 +81,10 @@ export function createSubagentTool(
   isConcurrencySafe: (args: unknown) => boolean;
 } {
   const buildChildTools = (runtime: () => QgisRuntimeInfo | undefined): ToolRegistry => {
-    const registry = new ToolRegistry({ logger: deps.toolLogger });
+    const registry = new ToolRegistry({
+      logger: deps.toolLogger,
+      sandbox: deps.getSandboxPolicy,
+    });
     registry.register(
       readFileToolDefinition,
       (args, toolContext) => executeReadFile(args, deps.getCwd(), toolContext),
@@ -84,8 +92,19 @@ export function createSubagentTool(
     );
     registry.register(
       listFilesToolDefinition,
-      (args) => executeListFiles(args, deps.getCwd()),
+      (args, toolContext) =>
+        executeListFiles(args, deps.getCwd(), toolContext?.sandbox),
       { isConcurrencySafe: () => true },
+    );
+    registry.register(
+      writeFileToolDefinition,
+      (args, toolContext) => executeWriteFile(args, toolContext),
+      { isConcurrencySafe: () => false },
+    );
+    registry.register(
+      editFileToolDefinition,
+      (args, toolContext) => executeEditFile(args, toolContext),
+      { isConcurrencySafe: () => false },
     );
     for (const tool of createQgisTools(runtime)) {
       registry.register(tool.definition, tool.handler, {

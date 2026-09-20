@@ -10,6 +10,8 @@ import {
   SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
   SYSTEM_PROMPT_VOLATILE_BOUNDARY,
 } from "./context-assembly.js";
+import type { ContextProjectionReport } from "./context-projection.js";
+import type { ContextCompressionReport } from "./context-compression.js";
 
 export interface ContextTraceMessage {
   index: number;
@@ -43,6 +45,8 @@ export interface ContextTraceEvent {
   messageCount: number;
   messageTokens?: number;
   toolDefinitionTokens?: number;
+  projection?: ContextProjectionReport;
+  compression?: ContextCompressionReport;
   systemPromptParts?: {
     staticText: string;
     dynamicText: string;
@@ -73,6 +77,8 @@ export class ContextTraceLogger {
     snapshot: ContextUsageSnapshot,
     messages: readonly ChatMessage[],
     tools: readonly ChatToolDefinition[] = [],
+    projection?: ContextProjectionReport,
+    compression?: ContextCompressionReport,
   ): Promise<void> {
     return this.record({
       schemaVersion: 1,
@@ -95,6 +101,8 @@ export class ContextTraceLogger {
         messages.filter((message) => message.role !== "system"),
       ),
       toolDefinitionTokens: estimateJsonTokens(tools),
+      ...(projection ? { projection } : {}),
+      ...(compression ? { compression } : {}),
       systemPromptParts: getSystemPromptParts(messages),
       messages: messages.map((message, index) => ({
         index,

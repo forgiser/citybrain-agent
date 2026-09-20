@@ -10,8 +10,12 @@ import {
 } from "../models/model-chat.js";
 import {
   buildSystemPromptForCwd,
+  compressContextMessages,
+  restoreContextProjectionState,
+  projectContextMessages,
   readAnalysisTask,
   type ContextBuildInputs,
+  type PersistedToolResultProjection,
 } from "../context/index.js";
 import { ModelRuntime } from "../models/model-runtime.js";
 import {
@@ -33,23 +37,21 @@ import type {
 } from "./agent-state.js";
 import { ToolExecutionLogger } from "../tools/tool-execution-log.js";
 import type {
-  ToolCallContext,
   ToolExecutionOutcome,
   ToolProgress,
   ToolRegistry,
 } from "../tools/tool-registry.js";
+import {
+  StreamingToolExecutor,
+  type StreamingToolEvent,
+  type ToolExecutionResult,
+  type ToolExecutionStarted,
+} from "../tools/streaming-tool-executor.js";
 export type { ToolProgress } from "../tools/tool-registry.js";
-
-export interface ToolExecutionStarted {
-  name: string;
-  argumentsText: string;
-  taskId?: string;
-}
-
-export interface ToolExecutionResult extends ToolExecutionStarted {
-  ok: boolean;
-  result: string;
-}
+export type {
+  ToolExecutionResult,
+  ToolExecutionStarted,
+} from "../tools/streaming-tool-executor.js";
 
 const MAX_TOOL_TURNS = 12;
 const MAX_IDENTICAL_TOOL_BATCHES = 3;
@@ -66,15 +68,7 @@ const FINALIZATION_INSTRUCTION =
 export type AgentEvent =
   | { type: "text"; delta: string }
   | { type: "thinking"; delta: string }
-  | ({ type: "tool_started" } & ToolExecutionStarted)
-  | ({ type: "tool_result" } & ToolExecutionResult)
-  | {
-      type: "tool_progress";
-      name: string;
-      argumentsText: string;
-      taskId: string;
-      progress: ToolProgress;
-    }
+  | StreamingToolEvent
   | ({ type: "state" } & AgentHarnessStateUpdate)
   | { type: "context"; snapshot: ContextUsageSnapshot }
   | ({ type: "agent_status" } & AgentStatusUpdate);
@@ -92,7 +86,11 @@ export class AgentLoop {
     private readonly contextLogger?: ContextUsageLogger,
     private readonly contextTraceLogger?: ContextTraceLogger,
     private readonly getContextInputs?: () => ContextBuildInputs,
-  ) {}
+  ) {
+    this.streamingToolExecutor = new StreamingToolExecutor(tools);
+  }
+
+  private readonly streamingToolExecutor: StreamingToolExecutor;
 
   getSelectedModel(): ModelDefinition | undefined {
     return this.modelRuntime.getSelectedModel();
@@ -155,6 +153,9 @@ export class AgentLoop {
         throw new Error("Provider is not logged in: " + model.provider);
       }
 
+      const projectionState = restoreContextProjectionState(
+        this.session.getContextReplacementRecords(),
+      );
       // Keep the canonical conversation separate from the system prompt.
       // The provider receives a combined request snapshot, but the agent
       // state never treats system instructions as ordinary conversation.
@@ -179,17 +180,36 @@ export class AgentLoop {
       while (true) {
         const contextInputs = this.getContextInputs?.() ?? {};
         const systemPrompt = await buildSystemPromptForCwd(
-          this.session.getCwd(),
+          this.session.getProjectDir(),
           {
             ...contextInputs,
             analysisTask:
               contextInputs.analysisTask ??
-              readAnalysisTask(this.session.getCwd()),
+              readAnalysisTask(this.session.getWorkspaceDir()),
+          },
+        );
+        let projection = await projectContextMessages(
+          conversationMessages,
+          this.session.getWorkspaceDir(),
+          undefined,
+          projectionState,
+        );
+        appendProjectionReplacements(this.session, projection.newReplacements);
+        const availableTools = finalizationRequested
+          ? []
+          : this.tools.definitions();
+        const compression = await compressContextMessages(
+          projection.messages,
+          {
+            contextWindow,
+            fixedTokens: estimateFixedContextTokens(systemPrompt, availableTools),
+            generateSummary: (messages) =>
+              this.generateContextSummary(model, credential, messages, options),
           },
         );
         let requestMessages: ChatMessage[] = [
           { role: "system", content: systemPrompt },
-          ...conversationMessages,
+          ...compression.messages,
         ];
 
         if (finalizationRequested) {
@@ -205,9 +225,6 @@ export class AgentLoop {
         let response = "";
         let thinking = "";
         const toolCalls = new Map<number, ChatToolCall>();
-        const availableTools = finalizationRequested
-          ? []
-          : this.tools.definitions();
         const currentRequestIndex = requestIndex++;
         const contextBase = {
           runId,
@@ -218,33 +235,6 @@ export class AgentLoop {
           contextWindow,
           contextWindowSource,
         } as const;
-        const compaction = this.session.compactContext(
-          contextWindow,
-          systemPrompt,
-          availableTools,
-          finalizationRequested ? "before_finalization" : "context_threshold",
-        );
-        if (compaction) {
-          latestUsage = undefined;
-          conversationMessages = this.session.getContextMessages();
-          requestMessages = [
-            { role: "system", content: systemPrompt },
-            ...conversationMessages,
-          ];
-          const compactedSnapshot = createEstimatedUsageSnapshot(
-            {
-              ...contextBase,
-              stage: "before_request",
-            },
-            estimateChatContextTokens(requestMessages, availableTools),
-          );
-          void this.contextTraceLogger?.recordCompaction(
-            compactedSnapshot,
-            finalizationRequested ? "before_finalization" : "context_threshold",
-            compaction,
-          );
-          yield publishContext(compactedSnapshot);
-        }
         // The previous provider usage belongs to the previous request. Since
         // the volatile system prompt may have changed, estimate this complete
         // request instead of blindly adding a trailing-message delta.
@@ -260,6 +250,8 @@ export class AgentLoop {
           beforeRequestSnapshot,
           requestMessages,
           availableTools,
+          projection.report,
+          compression.report,
         );
         let usageForCall: ModelUsage | undefined;
 
@@ -394,6 +386,7 @@ export class AgentLoop {
           resolvedToolCalls,
           runId,
           turn,
+          options.signal,
         );
         for (let index = 0; index < resolvedToolCalls.length; index++) {
           const outcome = outcomes[index]!;
@@ -451,131 +444,65 @@ export class AgentLoop {
     }
   }
 
-  /**
-   * Bridge the concurrent tool scheduler into the event stream. Tools emit
-   * events into a queue as they start/complete; this generator drains the
-   * queue and yields until every call has settled, then returns the outcomes
-   * in the original call order.
-   */
   private async *executeToolTurn(
     resolvedToolCalls: ChatToolCall[],
     runId: string,
     turn: number,
+    signal?: AbortSignal,
   ): AsyncGenerator<AgentEvent, ToolExecutionOutcome[], undefined> {
-    const events: AgentEvent[] = [];
-    let wake: (() => void) | undefined;
-    let finished = false;
-    const emit = (event: AgentEvent): void => {
-      events.push(event);
-      const pending = wake;
-      wake = undefined;
-      pending?.();
-    };
-
-    const runner = this.startToolCalls(
+    return yield* this.streamingToolExecutor.execute(
       resolvedToolCalls,
-      emit,
-      runId,
-      turn,
-    ).then(
-      (outcomes) => {
-        finished = true;
-        return outcomes;
-      },
-      (error) => {
-        finished = true;
-        throw error;
-      },
+      { runId, turn, signal },
     );
-
-    while (true) {
-      while (events.length > 0) {
-        yield events.shift()!;
-      }
-      if (finished) break;
-      await new Promise<void>((resolve) => {
-        wake = resolve;
-      });
-    }
-
-    return await runner;
   }
 
-  /**
-   * Start every tool call of one assistant turn according to the concurrency
-   * rules and return the outcomes in the original call order.
-   *
-   * Mirrors Claude Code's StreamingToolExecutor queue scan: walk the calls in
-   * order; a concurrency-safe tool starts immediately (all executing tools are
-   * safe by construction here), a non-safe tool waits for everything in flight
-   * and then runs exclusively - later calls queue behind it.
-   */
-  private async startToolCalls(
-    resolvedToolCalls: ChatToolCall[],
-    emit: (event: AgentEvent) => void,
-    runId: string,
-    turn: number,
-  ): Promise<ToolExecutionOutcome[]> {
-    const settlements: Promise<ToolExecutionOutcome>[] = new Array(
-      resolvedToolCalls.length,
-    );
-    let executing = new Set<Promise<unknown>>();
-
-    const start = (toolCall: ChatToolCall, index: number): void => {
-      emit({
-        type: "tool_started",
-        name: toolCall.name,
-        argumentsText: toolCall.arguments,
-      });
-      // Let a tool (e.g. delegate) stream subagent status updates up as
-      // agent_status events in the same queue as tool_started/tool_result.
-      const context: ToolCallContext = {
-        emitAgentStatus: (update) => emit({ type: "agent_status", ...update }),
-        runId,
-        turn,
-        toolCallId: toolCall.id,
-        emitProgress: (progress) => {
-          emit({
-            type: "tool_progress",
-            name: toolCall.name,
-            argumentsText: toolCall.arguments,
-            taskId: progress.taskId ?? toolCall.id,
-            progress,
-          });
-        },
-      };
-      const settlement = this.tools
-        .execute(toolCall.name, toolCall.arguments, context)
-        .then((outcome) => {
-          emit({
-            type: "tool_result",
-            name: toolCall.name,
-            argumentsText: toolCall.arguments,
-            taskId: outcome.taskId,
-            ok: outcome.ok,
-            result: outcome.content,
-          });
-          return outcome;
-        });
-      settlements[index] = settlement;
-      executing.add(settlement);
-      void settlement
-        .catch(() => undefined)
-        .finally(() => executing.delete(settlement));
-    };
-
-    for (let index = 0; index < resolvedToolCalls.length; index++) {
-      const toolCall = resolvedToolCalls[index]!;
-      if (this.tools.isConcurrencySafe(toolCall.name, toolCall.arguments)) {
-        start(toolCall, index);
-        continue;
+  private async generateContextSummary(
+    model: ModelDefinition,
+    credential: NonNullable<ReturnType<AuthStorage["get"]>>,
+    messages: readonly ChatMessage[],
+    options: StreamChatOptions,
+  ): Promise<string | undefined> {
+    const summaryInput = messages.map((message, index) => {
+      const label = message.role === "tool"
+        ? `tool:${message.toolName ?? "unknown"}`
+        : message.role;
+      const calls = message.toolCalls?.length
+        ? `\nTool calls: ${message.toolCalls.map((call) =>
+          `${call.name}(${call.arguments})`).join(", ")}`
+        : "";
+      return `### ${index + 1}. ${label}${calls}\n${message.content}`;
+    }).join("\n\n");
+    const summaryMessages: ChatMessage[] = [
+      {
+        role: "system",
+        content: [
+          "You are the context compression component of a geospatial analysis agent.",
+          "Summarize the earlier conversation for another model that must continue the task.",
+          "Preserve user goals, confirmed facts, paths, parameters, tool outcomes, failures,",
+          "QGIS artifacts, pending work, and decisions. Remove repetition and speculation.",
+          "Return only a concise structured summary. Do not call tools.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: summaryInput,
+      },
+    ];
+    let summary = "";
+    try {
+      for await (const delta of streamModelChat(model, credential, summaryMessages, {
+        signal: options.signal,
+        fetchImpl: options.fetchImpl,
+        maxTokens: 4_096,
+        thinkingLevel: "off",
+        tools: [],
+      })) {
+        if (delta.type === "text") summary += delta.delta;
       }
-      await Promise.all(executing);
-      executing = new Set();
-      start(toolCall, index);
+    } catch (error) {
+      throw error;
     }
-
-    return Promise.all(settlements);
+    return summary.trim() || undefined;
   }
 
   setSession(session: SessionManager): void {
@@ -607,4 +534,28 @@ function buildFallbackResponse(
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function appendProjectionReplacements(
+  session: SessionManager,
+  records: readonly PersistedToolResultProjection[],
+): void {
+  for (const record of records) {
+    if (record.toolCallId) {
+      session.appendContextReplacement(record);
+    }
+  }
+}
+
+function estimateFixedContextTokens(
+  systemPrompt: string,
+  tools: readonly unknown[],
+): number {
+  let toolCharacters = 0;
+  try {
+    toolCharacters = JSON.stringify(tools).length;
+  } catch {
+    toolCharacters = 0;
+  }
+  return Math.ceil((systemPrompt.length + toolCharacters) / 4);
 }

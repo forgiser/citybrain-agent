@@ -32,6 +32,8 @@ export interface QgisProgress {
 
 export interface QgisCommandOptions {
   signal?: AbortSignal;
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
   onProgress?: (progress: QgisProgress) => void;
 }
 
@@ -208,7 +210,7 @@ async function runQgisCommandOutcome(
       client.executablePath,
       args,
       timeoutMs,
-      client.env,
+      { ...client.env, ...options.env },
       options,
     );
     if (outcome.exitCode !== 0) {
@@ -347,6 +349,7 @@ function spawnProcess(
     const startedAt = Date.now();
     const child = spawn(command, args, {
       windowsHide: true,
+      cwd: options.cwd,
       env,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -426,7 +429,7 @@ function runThroughBat(
     process.env.ComSpec || "cmd.exe",
     ["/d", "/c", "call", batPath, ...args],
     timeoutMs,
-    process.env,
+    { ...process.env, ...options.env },
     options,
   );
 }

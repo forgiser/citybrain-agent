@@ -43,6 +43,11 @@ export const shellCommands: ShellCommand[] = [
     argumentHint: "[<target-folder>]",
   },
   {
+    name: "/sandbox",
+    description: "查看或配置工作区级 sandbox 读写边界",
+    argumentHint: "[add-read|remove-read <directory>]",
+  },
+  {
     name: "/login",
     description: "保存一个供应商 API密钥",
     argumentHint: "<provider>",

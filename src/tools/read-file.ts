@@ -1,7 +1,11 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ChatToolDefinition } from "../models/model-chat.js";
 import type { ToolCallContext } from "./tool-registry.js";
+import {
+  createContentHash,
+  normalizeText,
+} from "./file-write-utils.js";
 
 const DEFAULT_FILE_LINE_LIMIT = 1_000;
 const MAX_FILE_LINE_LIMIT = 10_000;
@@ -51,7 +55,9 @@ export async function executeReadFile(
     throw new Error(`read_file limit must be <= ${MAX_FILE_LINE_LIMIT}.`);
   }
 
-  const target = resolve(cwd, args.path);
+  const target = context?.sandbox
+    ? context.sandbox.resolveReadPath(args.path, cwd)
+    : resolve(cwd, args.path);
   const artifacts = context?.artifacts;
   if (artifacts?.getPending(target)) {
     const terminalArtifact = await artifacts.waitForTerminal(
@@ -109,6 +115,17 @@ export async function executeReadFile(
 
   if (hasMore) {
     notices.push(`Use offset=${endLine + 1} to continue.`);
+  }
+
+  if (context?.recordFileRead && !hasMore && !truncatedByChars && offset === 1) {
+    const info = await stat(realTarget);
+    context.recordFileRead({
+      path: realTarget,
+      size: info.size,
+      mtimeMs: Math.floor(info.mtimeMs),
+      contentHash: createContentHash(normalizeText(content)),
+      fullRead: true,
+    });
   }
 
   return notices.length > 0 ? `${text}\n\n[${notices.join(" ")}]` : text;

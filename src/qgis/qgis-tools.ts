@@ -20,7 +20,7 @@ export interface QgisTool {
    * parallel runs with distinct OUTPUT paths — is a later refinement.
    */
   isConcurrencySafe?: (args: unknown) => boolean;
-  producesArtifacts?: (args: unknown) => string[];
+  producesArtifacts?: (args: unknown, context?: ToolCallContext) => string[];
 }
 
 type RuntimeGetter = () => QgisRuntimeInfo | undefined;
@@ -173,7 +173,7 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
         }
       }
 
-      resolveParameterPaths(parameters);
+      resolveParameterPaths(parameters, context);
       const timeoutMs = getTimeoutMs(parsed.timeoutSeconds);
       context?.emitProgress?.({
         phase: "running",
@@ -188,6 +188,8 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
           timeoutMs,
           {
             signal: context?.signal,
+            cwd: context?.sandbox?.sandboxRoot,
+            env: context?.sandbox?.getProcessEnvironment(),
             onProgress: (progress) => {
               context?.emitProgress?.({
                 phase: "running",
@@ -207,6 +209,9 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
         throw error;
       }
       const outputPaths = result.outputPaths;
+      for (const outputPath of outputPaths) {
+        context?.sandbox?.assertWritable(outputPath);
+      }
       context?.emitProgress?.({
         phase: "verifying_outputs",
         elapsedMs: result.durationMs,
@@ -272,21 +277,47 @@ function getTimeoutMs(value: unknown): number {
 
 function resolveParameterPaths(
   parameters: Record<string, string | number | boolean>,
+  context?: ToolCallContext,
 ): void {
   for (const [key, value] of Object.entries(parameters)) {
     if (typeof value !== "string") continue;
     const trimmed = value.trim();
     if (!trimmed) continue;
+    const isOutput = /^OUTPUT(?:_|$)/iu.test(key);
+    if (isOutput) {
+      if (/^TEMPORARY_OUTPUT$/iu.test(trimmed)) continue;
+      if (!context?.sandbox) {
+        parameters[key] = resolveWorkspacePath(trimmed);
+      } else {
+        parameters[key] = context.sandbox.resolveWritePath(trimmed);
+      }
+      continue;
+    }
+
     const looksLikePath = WINDOWS_ABSOLUTE_PATH.test(trimmed)
       || trimmed.startsWith("\\\\")
-      || trimmed.includes("/")
-      || trimmed.includes("\\");
+      || (isPathParameterKey(key) &&
+        (trimmed.includes("/") || trimmed.includes("\\")));
     if (!looksLikePath) continue;
-    parameters[key] = resolveWorkspacePath(trimmed);
+    if (!context?.sandbox) {
+      parameters[key] = resolveWorkspacePath(trimmed);
+      continue;
+    }
+
+    parameters[key] = context.sandbox.resolveReadPath(
+      trimmed,
+      context.sandbox.projectDir,
+    );
   }
 }
 
-function getQgisOutputPaths(args: unknown): string[] {
+function isPathParameterKey(key: string): boolean {
+  return /(?:INPUT|LAYER|SOURCE|OVERLAY|MASK|RASTER|VECTOR|DATABASE|FILE|PATH|DIRECTORY|TABLE|URI)/iu.test(
+    key,
+  );
+}
+
+function getQgisOutputPaths(args: unknown, context?: ToolCallContext): string[] {
   if (typeof args !== "object" || args === null) return [];
   const rawParameters = (args as { parameters?: unknown }).parameters;
   if (
@@ -301,7 +332,11 @@ function getQgisOutputPaths(args: unknown): string[] {
     if (!/^OUTPUT(?:_|$)/iu.test(key) || typeof value !== "string") continue;
     const trimmed = value.trim();
     if (!trimmed || /^TEMPORARY_OUTPUT$/iu.test(trimmed)) continue;
-    paths.push(resolveWorkspacePath(trimmed));
+    paths.push(
+      context?.sandbox
+        ? context.sandbox.resolveWritePath(trimmed)
+        : resolveWorkspacePath(trimmed),
+    );
   }
   return paths;
 }

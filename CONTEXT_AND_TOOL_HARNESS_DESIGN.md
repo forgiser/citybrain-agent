@@ -517,11 +517,11 @@ qgis_process returned exit code 0, but the declared output file was not created.
 ## Next Action
 ```
 
-第一版可以使用确定性规则摘要。后续可以增加独立的摘要模型调用，但摘要模型必须：
+当前已增加独立的摘要模型调用，但摘要模型必须：
 
 - 不调用业务工具；
 - 不改变原始 Session；
-- 将摘要写入 compaction entry；
+- 将摘要作为本次 request projection 的 working memory；
 - 失败时回退规则摘要；
 - 记录摘要前后 token 数。
 
@@ -892,7 +892,8 @@ requestTotalTokens
 - 已完成 provider prompt token、completion token、request total token 的分开记录；
 - 已完成 DeepSeek V4 可信 1M context window 覆盖较小 provider 元数据；
 - 已完成将当前 QGIS/tool artifact 的 `pending/ready/missing/invalid` 状态摘要注入 volatile context；
-- 工具结果预算、结果落盘策略与独立 `StreamingToolExecutor` 仍待后续阶段实现。
+- 工具结果预算与投影式结果落盘已在 Phase B 实现；
+  - 独立 `StreamingToolExecutor` 已在 Phase D 实现，AgentLoop 不再直接维护工具并发集合。
 
 主要文件：
 
@@ -924,19 +925,34 @@ src/session/session-manager.ts
 - 模型只接收 preview；
 - 支持通过 `read_file` 分段读取完整结果。
 
-新增建议文件：
+当前实现进度：
+
+- 已新增 `src/context/context-projection.ts`，作为模型请求前的独立 Context Projector；
+- 已新增 `src/context/tool-result-store.ts`，将超预算工具结果保存到 `<workspace>/.internal/tool-results`；
+  - 已实现按工具类型的条件式 inline budget；
+  - 未超预算的工具结果原样进入请求；
+  - 超预算的工具结果只在本次 projected context 中替换为预览和可恢复文件路径；
+  - Session JSONL 和 AgentLoop 的 canonical conversation 仍然保存完整工具结果；
+  - 以 `toolCallId` 为稳定键冻结投影决定，同一工具结果后续请求不会反复落盘或在预算变化时来回切换；
+  - 投影决定以 `context_replacement` 条目写入 Session JSONL，恢复会话后可以重建投影状态；
+  - 对连续工具结果批次增加聚合预算，避免多个单独未超限的结果叠加后撑大 request messages；
+  - `context-trace.jsonl` 记录 projection 前后 token、字符数、处理阶段和落盘文件；
+  - 本阶段暂不实现 microcompact、context collapse 和 LLM 全量摘要；这些能力在 Phase C 的请求级压缩流水线中实现。
+
+主要文件：
 
 ```text
-src/context/tool-result-budget.ts
+src/context/context-projection.ts
 src/context/tool-result-store.ts
 ```
 
 验收标准：
 
-- 大型 `list_files` 不会完整塞入 messages；
-- 大型 `read_file` 结果可以读取完整落盘文件；
-- 工具日志能看到原始大小和 inline 大小；
-- Session 保留完整结果引用而不是丢失结果。
+  - 大型 `list_files` 不会完整塞入 messages；
+  - 超预算工具结果可以通过 `read_file` 读取完整落盘文件；
+  - `context-trace.jsonl` 能看到原始大小、投影大小和落盘路径；
+  - Session 保留完整结果，模型请求只使用投影后的引用；
+  - 同一个 `toolCallId` 在多轮请求和恢复会话后都复用同一投影结果。
 
 ### Phase C：消息投影与多层压缩
 
@@ -948,12 +964,24 @@ src/context/tool-result-store.ts
 - 扩展全量摘要结构；
 - 保持原始 Canonical Transcript 不变。
 
-新增建议文件：
+当前实现进度：
+
+- 已新增 `src/context/context-compression.ts`，作为工具结果投影之后、模型请求之前的请求级压缩流水线；
+- 已实现历史片段剪枝：超过阈值时按用户消息边界保留近期上下文，并插入可追踪的历史摘要；
+- 已实现 microcompact：压缩较早的工具结果，只保留工具身份、调用 ID 和短预览，完整内容仍留在 canonical session 或 tool-result artifact；
+- 已实现 context collapse：轻量压缩后仍超预算时折叠更早的消息片段；
+- 已实现 LLM 摘要压缩：仅在前面阶段仍无法满足目标预算时，使用无工具的摘要请求生成结构化工作记忆；摘要请求失败时自动使用确定性摘要兜底；
+- 所有压缩只作用于本次 request messages，原始 Session JSONL 和 canonical conversation 不被改写；
+- 每个阶段记录 `applied/changed/tokensBefore/tokensAfter/removedMessages`，并写入 `context-trace.jsonl`；
+- 历史剪枝和折叠只在用户消息边界执行，保证 assistant tool call 与 tool result 不被拆开；
+- 压缩目标预算会扣除 System Prompt、工具定义和保留缓冲，避免只按 messages 估算造成请求超限。
+
+主要文件：
 
 ```text
-src/context/message-projector.ts
-src/context/compression-pipeline.ts
-src/context/context-summary.ts
+src/context/context-compression.ts
+src/context/context-projection.ts
+src/context/tool-result-store.ts
 ```
 
 验收标准：
@@ -962,32 +990,34 @@ src/context/context-summary.ts
 - 每个阶段记录压缩前后 token；
 - tool call/tool result 始终成对；
 - 重要用户目标、参数、失败和 artifact 不会被剪掉；
-- 普通旧工具结果可以被压缩成结构化状态。
+- 普通旧工具结果可以被压缩成结构化状态；
+- 摘要请求不会携带工具定义，不会在压缩过程中再次进入工具循环。
 
 ### Phase D：独立 StreamingToolExecutor
 
 目标：
 
 - 从 AgentLoop 移出工具调度逻辑；
-- 建立工具任务注册表；
-- 统一处理进度、取消、超时和错误；
-- 保证工具结果和 tool call 严格配对。
+- 建立工具任务执行队列；
+- 统一处理进度、AbortSignal 和错误；
+- 保证工具结果和 tool call 严格配对；
+- 并发安全工具可以并行，独占工具会等待当前批次完成后再运行；
+- 工具事件以 started/progress/result 生命周期实时回传 CLI。
 
-新增建议文件：
+当前实现进度：
 
 ```text
 src/tools/streaming-tool-executor.ts
-src/tools/tool-task-registry.ts
-src/tools/tool-result-envelope.ts
 ```
 
 验收标准：
 
 - AgentLoop 不再直接维护工具并发集合；
-- 工具状态可独立查询；
+- 工具执行队列和事件流由 `StreamingToolExecutor` 独立维护；
 - 工具进度不进入模型 messages；
-- 工具中断时能够生成合法的失败 tool result；
-- 一个工具失败时可以按策略取消相关依赖工具。
+- 工具的 `AbortSignal` 能传递到具体 handler；
+- 工具失败时能够返回合法的失败 tool result；
+- CLI 按 thinking、工具执行和后续 assistant 响应的真实顺序渲染。
 
 ### Phase E：依赖图和高级任务调度
 

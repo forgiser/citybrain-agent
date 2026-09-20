@@ -18,9 +18,10 @@ import {
   type SlashCommand,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { join } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { styleText } from "node:util";
-import { AgentLoop } from "../agent/agent-loop.js";
+import { AgentLoop, type AgentEvent } from "../agent/agent-loop.js";
 import type {
   ToolExecutionResult,
   ToolExecutionStarted,
@@ -76,6 +77,14 @@ import {
   executeListFiles,
   listFilesToolDefinition,
 } from "../tools/list-files.js";
+import {
+  executeWriteFile,
+  writeFileToolDefinition,
+} from "../tools/write-file.js";
+import {
+  editFileToolDefinition,
+  executeEditFile,
+} from "../tools/edit-file.js";
 import { createSubagentTool } from "../tools/subagent-tool.js";
 import { ContextUsageLogger } from "../context/context-usage-log.js";
 import { ContextTraceLogger } from "../context/context-trace-log.js";
@@ -85,6 +94,11 @@ import {
   ensureWorkspace,
   type WorkspaceInfo,
 } from "../workspace/workspace.js";
+import {
+  addWorkspaceReadRoot,
+  removeWorkspaceReadRoot,
+  SandboxPolicy,
+} from "../workspace/sandbox-policy.js";
 import { findShellCommand, shellCommands } from "./shell-commands.js";
 
 const VERSION = "0.1.0";
@@ -149,24 +163,43 @@ export async function startInteractiveApp(): Promise<void> {
   let qgisRuntime = await detectQgisRuntime();
   let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
   const toolLogger = new ToolExecutionLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "tool-execution.jsonl"),
+    () => join(session.getWorkspaceDir(), ".internal", "logs", "tool-execution.jsonl"),
   );
   const contextLogger = new ContextUsageLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "context-usage.jsonl"),
+    () => join(session.getWorkspaceDir(), ".internal", "logs", "context-usage.jsonl"),
   );
   const contextTraceLogger = new ContextTraceLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "context-trace.jsonl"),
+    () => join(session.getWorkspaceDir(), ".internal", "logs", "context-trace.jsonl"),
   );
-  const toolRegistry = new ToolRegistry({ logger: toolLogger });
+  const toolRegistry = new ToolRegistry({
+    logger: toolLogger,
+    sandbox: () =>
+      SandboxPolicy.fromWorkspace(
+        session.getWorkspaceDir(),
+        session.getProjectDir(),
+      ),
+  });
   toolRegistry.register(
     readFileToolDefinition,
-    (args, toolContext) => executeReadFile(args, session.getCwd(), toolContext),
+    (args, toolContext) =>
+      executeReadFile(args, session.getProjectDir(), toolContext),
     { isConcurrencySafe: () => true },
   );
   toolRegistry.register(
     listFilesToolDefinition,
-    (args) => executeListFiles(args, session.getCwd()),
+    (args, toolContext) =>
+      executeListFiles(args, session.getProjectDir(), toolContext?.sandbox),
     { isConcurrencySafe: () => true },
+  );
+  toolRegistry.register(
+    writeFileToolDefinition,
+    (args, toolContext) => executeWriteFile(args, toolContext),
+    { isConcurrencySafe: () => false },
+  );
+  toolRegistry.register(
+    editFileToolDefinition,
+    (args, toolContext) => executeEditFile(args, toolContext),
+    { isConcurrencySafe: () => false },
   );
   for (const tool of createQgisTools(() => qgisRuntime)) {
     toolRegistry.register(tool.definition, tool.handler, {
@@ -174,9 +207,14 @@ export async function startInteractiveApp(): Promise<void> {
     });
   }
   const delegateTool = createSubagentTool({
-    modelRuntime,
-    authStorage,
-    getCwd: () => session.getCwd(),
+      modelRuntime,
+      authStorage,
+    getCwd: () => session.getProjectDir(),
+    getSandboxPolicy: () =>
+      SandboxPolicy.fromWorkspace(
+        session.getWorkspaceDir(),
+        session.getProjectDir(),
+      ),
     getQgisRuntime: () => qgisRuntime,
     toolLogger,
     contextLogger,
@@ -198,6 +236,7 @@ export async function startInteractiveApp(): Promise<void> {
         ? `${qgisRuntime.version} (${qgisRuntime.executablePath})`
         : undefined,
       artifactSummary: formatArtifactSummary(toolRegistry.artifacts.snapshot()),
+      additionalWorkingDirectories: [session.getWorkspaceDir()],
     }),
   );
   const terminal = new ProcessTerminal();
@@ -211,11 +250,11 @@ export async function startInteractiveApp(): Promise<void> {
   const modelStatus = new FooterStatus();
   const agentStatusFooter = new AgentStatusFooter();
   const sandboxStatus = new SandboxStatus();
-  sandboxStatus.setPath(session.getWorkspaceDir());
+  sandboxStatus.setPath(session.getProjectDir());
   const setSession = (nextSession: SessionManager): void => {
     session = nextSession;
     agentLoop.setSession(nextSession);
-    sandboxStatus.setPath(nextSession.getWorkspaceDir());
+    sandboxStatus.setPath(nextSession.getProjectDir());
     tui.requestRender();
   };
   const setQgisRuntime = (nextRuntime: QgisRuntimeInfo | undefined): void => {
@@ -394,7 +433,7 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
       case "/new":
       case "/clear":
         clearSystemPromptSections();
-        context.session.newSession(process.cwd());
+        context.session.newSession(context.session.getProjectDir());
         context.setSession(context.session);
         clearTranscript(context);
         addTranscript(context, createSessionStateMessage("new", context.session));
@@ -421,6 +460,9 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
       case "/init":
         await handleInitCommand(getCommandArgument(input), context);
         return;
+      case "/sandbox":
+        await handleSandboxCommand(getCommandArgument(input), context);
+        return;
       case "/login":
         await handleLoginCommand(getCommandArgument(input), context);
         return;
@@ -433,7 +475,7 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
   // First question of a session: ensure the project workspace skeleton exists,
   // creating it under the session's working directory if missing.
   if (context.session.getMessageCount() === 0) {
-    const info = ensureWorkspace(context.session.getCwd());
+    const info = ensureWorkspace(context.session.getProjectDir());
     if (info.created.length > 0) {
       addTranscript(context, createWorkspaceMessage(info));
     }
@@ -448,8 +490,6 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
   addTranscript(context, responseComponent);
   context.editor.disableSubmit = true;
   context.agentStatusFooter.clear();
-  let responseText = "";
-  let thinkingText = "";
 
   try {
     const eventStream = context.agentLoop.run(input, {
@@ -457,48 +497,33 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
     });
     for await (const event of eventStream) {
       if (event.type === "text") {
-        responseText += event.delta;
-        responseComponent.setContent(
-          thinkingText,
-          responseText,
-          true,
-        );
+        responseComponent.appendText(event.delta);
         context.tui.requestRender();
         continue;
       }
       if (event.type === "thinking") {
-        thinkingText += event.delta;
-        responseComponent.setContent(
-          thinkingText,
-          responseText,
-          true,
-        );
+        responseComponent.appendThinking(event.delta);
         context.tui.requestRender();
         continue;
       }
       if (event.type === "tool_started") {
         // delegate is rendered as its own agent status line, not a tool box.
         if (event.name !== "delegate") {
-          responseComponent.setToolStatus(
-            createToolRunningMessage(event),
-          );
+          responseComponent.startTool(event);
         }
         context.tui.requestRender();
         continue;
       }
       if (event.type === "tool_progress") {
         if (event.name !== "delegate") {
-          responseComponent.setToolStatus(
-            createToolProgressMessage(event.name, event.progress),
-          );
+          responseComponent.updateToolProgress(event);
         }
         context.tui.requestRender();
         continue;
       }
       if (event.type === "tool_result") {
-        responseComponent.setToolStatus("");
         if (event.name !== "delegate") {
-          responseComponent.addToolResult(event);
+          responseComponent.completeTool(event);
         }
         context.tui.requestRender();
         continue;
@@ -521,7 +546,7 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
       }
     }
     responseComponent.setHarnessStatus("");
-    responseComponent.setContent(thinkingText, responseText, false);
+    responseComponent.setCompleted();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     responseComponent.setError(message);
@@ -629,7 +654,8 @@ function createSessionStateMessage(
     [
       color("────────────────────────────────────────────────"),
       `${color(title)}  ${colors.dim(info.id.slice(0, 8))}  ${colors.dim(detail)}${session.isPersisted() ? "" : `  ${colors.dim("(not saved)")}`}`,
-      `${colors.dim("sandbox")}  ${colors.dim(session.getWorkspaceDir())}`,
+      `${colors.dim("sandbox")}  ${colors.dim(session.getProjectDir())}`,
+      `${colors.dim("citybrain")} ${colors.dim(session.getWorkspaceDir())}`,
       color("────────────────────────────────────────────────"),
     ].join("\n"),
     2,
@@ -888,15 +914,9 @@ async function handleInitCommand(
   targetArgument: string | undefined,
   context: SubmitContext,
 ): Promise<void> {
-  if (targetArgument && targetArgument.split(/\s+/).length > 1) {
-    addTranscript(
-      context,
-      new Text(`${colors.yellow("usage")}  /init [<target-folder>]`, 2, 0),
-    );
-    return;
-  }
-
-  let targetDir = targetArgument?.trim();
+  let targetDir = targetArgument
+    ?.trim()
+    .replace(/^(["'])(.*)\1$/u, "$2");
   if (!targetDir) {
     const choice = await selectInitTarget(context);
     if (!choice) {
@@ -910,14 +930,14 @@ async function handleInitCommand(
         return;
       }
     } else {
-      targetDir = context.session.getCwd();
+      targetDir = context.session.getProjectDir();
     }
   }
 
   try {
     const info = ensureWorkspace(targetDir);
     context.session.setWorkspaceDir(info.workspaceDir);
-    context.sandboxStatus.setPath(info.workspaceDir);
+    context.sandboxStatus.setPath(info.projectDir);
     addTranscript(context, createWorkspaceMessage(info));
   } catch (error) {
     addTranscript(
@@ -931,13 +951,88 @@ async function handleInitCommand(
   }
 }
 
+async function handleSandboxCommand(
+  argument: string | undefined,
+  context: SubmitContext,
+): Promise<void> {
+  const policy = SandboxPolicy.fromWorkspace(
+    context.session.getWorkspaceDir(),
+    context.session.getProjectDir(),
+  );
+  const value = argument?.trim();
+  if (!value) {
+    addTranscript(
+      context,
+      new Text(colors.cyan("sandbox") + "\n" + policy.describe(), 2, 0),
+    );
+    return;
+  }
+
+  const [action, ...pathParts] = value.split(/\s+/);
+  const requestedPath = pathParts
+    .join(" ")
+    .replace(/^(["'])(.*)\1$/u, "$2")
+    .trim();
+  if (!requestedPath || !["add-read", "remove-read"].includes(action ?? "")) {
+    addTranscript(
+      context,
+      new Text(
+        [
+          colors.yellow("usage"),
+          "  /sandbox",
+          "  /sandbox add-read <directory>",
+          "  /sandbox remove-read <directory>",
+        ].join("\n"),
+        2,
+        0,
+      ),
+    );
+    return;
+  }
+
+  const resolvedReadRoot = isAbsolute(requestedPath)
+    ? requestedPath
+    : resolve(context.session.getProjectDir(), requestedPath);
+  if (!existsSync(resolvedReadRoot) || !statSync(resolvedReadRoot).isDirectory()) {
+    addTranscript(
+      context,
+      new Text(
+        colors.red("sandbox failed") + `  Directory not found: ${resolvedReadRoot}`,
+        2,
+        0,
+      ),
+    );
+    return;
+  }
+
+  const manifest = action === "add-read"
+    ? addWorkspaceReadRoot(policy.workspaceRoot, policy.projectDir, resolvedReadRoot)
+    : removeWorkspaceReadRoot(policy.workspaceRoot, policy.projectDir, resolvedReadRoot);
+  addTranscript(
+    context,
+    new Text(
+      [
+        colors.green(action === "add-read" ? "read root added" : "read root removed"),
+        `  ${resolvedReadRoot}`,
+        "",
+        `  sandbox root: ${manifest.sandboxRoot}`,
+        `  workspace/control dir: ${manifest.workspaceRoot}`,
+        `  write root: ${manifest.sandboxRoot}`,
+        `  read roots: ${manifest.readRoots.join(", ")}`,
+      ].join("\n"),
+      2,
+      0,
+    ),
+  );
+}
+
 async function selectInitTarget(context: SubmitContext): Promise<string | undefined> {
   const selector = new SelectList(
     [
       {
         value: INIT_USE_CURRENT,
         label: "当前文件夹（默认）",
-        description: context.session.getCwd(),
+        description: context.session.getProjectDir(),
       },
       {
         value: INIT_CHOOSE_OTHER,
@@ -1012,7 +1107,15 @@ function createWorkspaceMessage(info: WorkspaceInfo): Text {
 
 async function handleResumeCommand(context: SubmitContext): Promise<void> {
   const currentPath = context.session.getSessionFile();
-  const sessions = SessionManager.list(process.cwd());
+  const sessions = [
+    ...SessionManager.list(process.cwd()),
+    ...SessionManager.list(context.session.getProjectDir()),
+  ]
+    .filter(
+      (session, index, all) =>
+        all.findIndex((candidate) => candidate.path === session.path) === index,
+    )
+    .sort((left, right) => right.modifiedAt - left.modifiedAt);
 
   if (sessions.length === 0) {
     addTranscript(
@@ -1915,6 +2018,24 @@ function createToolResultComponent(event: ToolExecutionResult): Box {
   return box;
 }
 
+function createToolRunningComponent(segment: ToolSegment): Box {
+  const box = new Box(
+    1,
+    1,
+    colors.toolSuccessBackground,
+  );
+  const target = getToolTarget(segment.event.argumentsText);
+  const header = createToolHeader(segment.event.name, target);
+  box.addChild(
+    new Text(
+      `${header}\n${colors.dim(segment.status || "running")}`,
+      0,
+      0,
+    ),
+  );
+  return box;
+}
+
 /** One subagent's status, formatted as a single dim footer line. */
 function formatAgentStatusLine(agent: AgentStatusUpdate): string {
   const name = colors.agentTitle(agent.agent);
@@ -1990,15 +2111,13 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 class AssistantResponseComponent extends Container {
-  private thinking = "";
-  private response = "";
+  private segments: ResponseSegment[] = [];
   private error = "";
   private isStreaming = false;
   private showThinking = true;
-  private toolStatus = "";
-  private toolResults: ToolExecutionResult[] = [];
   private harnessStatus = "";
   private contextUsage = "";
+  private readonly toolsById = new Map<string, ToolSegment>();
 
   setContent(
     thinking: string,
@@ -2006,16 +2125,76 @@ class AssistantResponseComponent extends Container {
     isStreaming: boolean,
     showThinking = true,
   ): void {
-    this.thinking = thinking;
-    this.response = response;
+    this.segments = [{
+      kind: "assistant",
+      thinking,
+      response,
+      closed: false,
+    }];
+    this.toolsById.clear();
     this.error = "";
     this.isStreaming = isStreaming;
     this.showThinking = showThinking;
     this.rebuild();
   }
 
-  setToolStatus(status: string): void {
-    this.toolStatus = status;
+  appendThinking(delta: string): void {
+    const segment = this.ensureAssistantSegment();
+    segment.thinking += delta;
+    this.isStreaming = true;
+    this.rebuild();
+  }
+
+  appendText(delta: string): void {
+    const segment = this.ensureAssistantSegment();
+    segment.response += delta;
+    this.isStreaming = true;
+    this.rebuild();
+  }
+
+  startTool(event: ToolExecutionStarted): void {
+    const current = this.segments.at(-1);
+    if (current?.kind === "assistant") current.closed = true;
+    const segment: ToolSegment = {
+      kind: "tool",
+      event: {
+        name: event.name,
+        argumentsText: event.argumentsText,
+        taskId: event.taskId,
+        toolCallId: event.toolCallId,
+        ok: false,
+        result: "",
+      },
+      status: createToolRunningMessage(event),
+      completed: false,
+    };
+    this.segments.push(segment);
+    this.toolsById.set(event.toolCallId ?? `${event.name}:${this.segments.length}`, segment);
+    this.rebuild();
+  }
+
+  updateToolProgress(event: Extract<AgentEvent, { type: "tool_progress" }>): void {
+    const segment = this.findToolSegment(event.toolCallId);
+    if (segment) {
+      segment.status = createToolProgressMessage(event.name, event.progress);
+    }
+    this.rebuild();
+  }
+
+  completeTool(result: ToolExecutionResult): void {
+    const segment = this.findToolSegment(result.toolCallId);
+    if (segment) {
+      segment.event = result;
+      segment.completed = true;
+      segment.status = "";
+    } else {
+      this.segments.push({
+        kind: "tool",
+        event: result,
+        status: "",
+        completed: true,
+      });
+    }
     this.rebuild();
   }
 
@@ -2029,41 +2208,61 @@ class AssistantResponseComponent extends Container {
     this.rebuild();
   }
 
-  addToolResult(result: ToolExecutionResult): void {
-    this.toolResults.push(result);
+  setCompleted(): void {
+    this.isStreaming = false;
     this.rebuild();
   }
 
   setError(error: string): void {
     this.error = error;
+    this.isStreaming = false;
     this.rebuild();
+  }
+
+  private ensureAssistantSegment(): AssistantSegment {
+    const current = this.segments.at(-1);
+    if (current?.kind === "assistant" && !current.closed) return current;
+    const next: AssistantSegment = {
+      kind: "assistant",
+      thinking: "",
+      response: "",
+      closed: false,
+    };
+    this.segments.push(next);
+    return next;
+  }
+
+  private findToolSegment(toolCallId?: string): ToolSegment | undefined {
+    if (toolCallId) return this.toolsById.get(toolCallId);
+    return [...this.segments].reverse().find(
+      (segment): segment is ToolSegment => segment.kind === "tool" && !segment.completed,
+    );
   }
 
   private rebuild(): void {
     this.clear();
 
-    if (this.showThinking && this.thinking.trim()) {
-      this.addChild(
-        new Markdown(
-          this.thinking.trim(),
-          2,
-          0,
-          createMarkdownTheme(),
-          {
-            color: colors.thinkingText,
-            italic: true,
-          },
-        ),
-      );
-      if (this.response.trim() || this.isStreaming) {
-        this.addChild(new Spacer(1));
+    const lastAssistantIndex = this.segments.reduce(
+      (last, segment, index) => segment.kind === "assistant" ? index : last,
+      -1,
+    );
+    for (let index = 0; index < this.segments.length; index += 1) {
+      const segment = this.segments[index]!;
+      if (segment.kind === "assistant") {
+        this.renderAssistantSegment(
+          segment,
+          index === lastAssistantIndex && !this.segments.slice(index + 1).some(
+            (next) => next.kind === "tool",
+          ),
+        );
+      } else {
+        this.addChild(
+          segment.completed
+            ? createToolResultComponent(segment.event)
+            : createToolRunningComponent(segment),
+        );
       }
-    } else if (this.isStreaming && !this.response.trim() && !this.error) {
-      this.addChild(new Text(colors.thinkingText("Thinking..."), 2, 0));
-    }
-
-    if (this.toolStatus) {
-      this.addChild(new Text(colors.dim(this.toolStatus), 2, 0));
+      if (index < this.segments.length - 1) this.addChild(new Spacer(1));
     }
 
     if (this.harnessStatus) {
@@ -2074,23 +2273,43 @@ class AssistantResponseComponent extends Container {
       this.addChild(new Text(colors.dim(this.contextUsage), 2, 0));
     }
 
-    for (const toolResult of this.toolResults) {
-      this.addChild(createToolResultComponent(toolResult));
-    }
-
-    if (this.toolResults.length > 0 && (this.response.trim() || this.error)) {
-      this.addChild(new Spacer(1));
-    }
-
     if (this.error) {
       this.addChild(new Text(`${colors.red("citybrain error")}\n\n${this.error}`, 2, 1));
-      return;
+    } else if (
+      this.isStreaming &&
+      !this.segments.some((segment) =>
+        segment.kind === "assistant" && (segment.thinking.trim() || segment.response.trim()),
+      )
+    ) {
+      this.addChild(new Text(colors.thinkingText("Thinking..."), 2, 0));
     }
+  }
 
-    if (this.response.trim()) {
+  private renderAssistantSegment(
+    segment: AssistantSegment,
+    isFinalResponse: boolean,
+  ): void {
+    if (this.showThinking && segment.thinking.trim()) {
       this.addChild(
         new Markdown(
-          `${colors.green("citybrain")}\n\n${this.response}`,
+          segment.thinking.trim(),
+          2,
+          0,
+          createMarkdownTheme(),
+          {
+            color: colors.thinkingText,
+            italic: true,
+          },
+        ),
+      );
+      if (segment.response.trim()) this.addChild(new Spacer(1));
+    }
+
+    if (segment.response.trim()) {
+      const heading = isFinalResponse ? `${colors.green("citybrain")}\n\n` : "";
+      this.addChild(
+        new Markdown(
+          `${heading}${segment.response.trim()}`,
           2,
           1,
           createMarkdownTheme(),
@@ -2099,6 +2318,22 @@ class AssistantResponseComponent extends Container {
     }
   }
 }
+
+interface AssistantSegment {
+  kind: "assistant";
+  thinking: string;
+  response: string;
+  closed: boolean;
+}
+
+interface ToolSegment {
+  kind: "tool";
+  event: ToolExecutionResult;
+  status: string;
+  completed: boolean;
+}
+
+type ResponseSegment = AssistantSegment | ToolSegment;
 
 interface SessionSelectItem {
   value: string;

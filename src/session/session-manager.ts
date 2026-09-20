@@ -17,6 +17,7 @@ import {
   type CompactionPlan,
 } from "../context/context-compaction.js";
 import { getWorkspaceDir as resolveWorkspaceDir } from "../workspace/workspace.js";
+import { readWorkspaceManifest } from "../workspace/sandbox-policy.js";
 import type { ChatMessage, ModelUsage } from "../models/model-chat.js";
 import type {
   ContextUsage,
@@ -28,8 +29,10 @@ import type {
   SessionMessage,
   SessionMessageEntry,
   CompactionEntry,
+  ContextReplacementEntry,
   SessionEntryBase,
 } from "./session-types.js";
+import type { PersistedToolResultProjection } from "../context/context-projection.js";
 
 const SESSION_VERSION = 1;
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -159,6 +162,17 @@ export class SessionManager {
     return this.header.cwd;
   }
 
+  /**
+   * Active project root for the selected workspace. This may differ from the
+   * process cwd when `/init <target-folder>` selects another project.
+   */
+  getProjectDir(): string {
+    return readWorkspaceManifest(
+      this.getWorkspaceDir(),
+      this.header.cwd,
+    ).projectDir;
+  }
+
   /** 文件系统沙箱目录（citybrain/ 工作区）的绝对路径。 */
   getWorkspaceDir(): string {
     return this.header.workspaceDir ?? resolveWorkspaceDir(this.header.cwd);
@@ -192,6 +206,13 @@ export class SessionManager {
     return this.entries.filter((entry) => entry.type === "message").length;
   }
 
+  getContextReplacementRecords(): ContextReplacementEntry[] {
+    return this.entries.filter(
+      (entry): entry is ContextReplacementEntry =>
+        entry.type === "context_replacement",
+    );
+  }
+
   getContextMessages(): ChatMessage[] {
     const boundaryIndex = this.findLatestCompactionIndex();
     const messages = this.entries
@@ -219,11 +240,13 @@ export class SessionManager {
     systemPrompt: string,
     tools: unknown[],
     reason: string,
+    projectedMessages?: readonly ChatMessage[],
   ): CompactionPlan | undefined {
     const currentMessages = this.getContextMessages();
+    const messagesForEstimate = projectedMessages ?? currentMessages;
     const estimatedTokens = Math.ceil(
       (systemPrompt.length + JSON.stringify(tools).length) / 4,
-    ) + estimateMessages(currentMessages);
+    ) + estimateMessages(messagesForEstimate);
     if (estimatedTokens <= contextWindow - 16_384) return undefined;
 
     const plan = createCompactionPlan(currentMessages);
@@ -324,6 +347,29 @@ export class SessionManager {
       parentId: this.getLeafId(),
       timestamp: new Date().toISOString(),
       ...input,
+    };
+    this.appendEntry(entry);
+    return entry.id;
+  }
+
+  appendContextReplacement(
+    record: PersistedToolResultProjection,
+  ): string {
+    if (!record.toolCallId) {
+      throw new Error("A context replacement requires a tool call id.");
+    }
+    const entry: ContextReplacementEntry = {
+      type: "context_replacement",
+      id: createEntryId(),
+      parentId: this.getLeafId(),
+      timestamp: new Date().toISOString(),
+      toolCallId: record.toolCallId,
+      ...(record.toolName ? { toolName: record.toolName } : {}),
+      path: record.path,
+      replacement: record.replacement,
+      originalCharacters: record.originalCharacters,
+      originalTokens: record.originalTokens,
+      projectedTokens: record.projectedTokens,
     };
     this.appendEntry(entry);
     return entry.id;
@@ -434,6 +480,18 @@ function isSessionFileEntry(value: unknown): value is SessionFileEntry {
       typeof value.keptMessages === "number" &&
       typeof value.removedMessages === "number" &&
       typeof value.reason === "string"
+    );
+  }
+
+  if (value.type === "context_replacement") {
+    return (
+      typeof value.toolCallId === "string" &&
+      typeof value.path === "string" &&
+      typeof value.replacement === "string" &&
+      typeof value.originalCharacters === "number" &&
+      typeof value.originalTokens === "number" &&
+      typeof value.projectedTokens === "number" &&
+      (value.toolName === undefined || typeof value.toolName === "string")
     );
   }
 

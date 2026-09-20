@@ -27,8 +27,8 @@ export function getSkillsIndexPath(): string {
 }
 
 /** L1 progress file path — inside the given working directory (the project). */
-export function getAnalysisTaskPath(cwd: string): string {
-  return join(cwd, "ANALYSIS_TASK.md");
+export function getAnalysisTaskPath(workspaceDir: string): string {
+  return join(workspaceDir, "ANALYSIS_TASK.md");
 }
 
 const INDEX_MAX_BYTES = 25_000;
@@ -54,13 +54,13 @@ export function readSkillsIndex(): string | undefined {
 }
 
 /** Read the L1 current-task progress file for a working dir, if present. */
-export function readAnalysisTask(cwd: string): string | undefined {
-  return readMaybe(getAnalysisTaskPath(cwd));
+export function readAnalysisTask(workspaceDir: string): string | undefined {
+  return readMaybe(getAnalysisTaskPath(workspaceDir));
 }
 
 /** Write (create/refresh) the L1 current-task progress file for a working dir. */
-export function writeAnalysisTask(cwd: string, content: string): string {
-  const path = getAnalysisTaskPath(cwd);
+export function writeAnalysisTask(workspaceDir: string, content: string): string {
+  const path = getAnalysisTaskPath(workspaceDir);
   mkdirSync(join(path, ".."), { recursive: true });
   writeFileSync(path, content.endsWith("\n") ? content : `${content}\n`, "utf8");
   return path;

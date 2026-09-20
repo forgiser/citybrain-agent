@@ -1,6 +1,7 @@
 import { lstat, readdir } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import type { ChatToolDefinition } from "../models/model-chat.js";
+import type { SandboxPolicy } from "../workspace/sandbox-policy.js";
 
 const DEFAULT_LIMIT = 200;
 const MAX_LIMIT = 10_000;
@@ -47,6 +48,7 @@ export const listFilesToolDefinition: ChatToolDefinition = {
 export async function executeListFiles(
   args: unknown,
   cwd: string = process.cwd(),
+  sandbox?: SandboxPolicy,
 ): Promise<string> {
   if (!isRecord(args)) {
     throw new Error("list_files expects an object of arguments.");
@@ -57,7 +59,9 @@ export async function executeListFiles(
   const recursive = args.recursive === true;
   const limit = getLimit(args.limit);
 
-  const root = resolve(cwd, pathArg);
+  const root = sandbox
+    ? sandbox.resolveReadPath(pathArg, cwd)
+    : resolve(cwd, pathArg);
   const rootInfo = await lstat(root);
   if (!rootInfo.isDirectory()) {
     throw new Error(`Not a directory: ${pathArg}`);
