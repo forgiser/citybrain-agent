@@ -4,14 +4,29 @@ import type { ChatToolCall } from "../models/model-chat.js";
 import {
   ToolRegistry,
   type ToolExecutionOutcome,
+  type ToolLifecycleEvent,
   type ToolProgress,
 } from "./tool-registry.js";
+import type { ToolInterruptBehavior, ToolSource } from "./tool-contract.js";
+import {
+  normalizeHarnessError,
+  type HarnessError,
+  type HarnessRecoveryDecision,
+} from "../harness/index.js";
 
 export interface ToolExecutionStarted {
   name: string;
   argumentsText: string;
   taskId?: string;
   toolCallId?: string;
+  source?: ToolSource;
+  readOnly?: boolean;
+  destructive?: boolean;
+  concurrencySafe?: boolean;
+  interruptBehavior?: ToolInterruptBehavior;
+  paths?: string[];
+  activityDescription?: string;
+  toolUseSummary?: string;
 }
 
 export interface ToolExecutionResult extends ToolExecutionStarted {
@@ -29,6 +44,23 @@ export type StreamingToolEvent =
       taskId: string;
       toolCallId: string;
       progress: ToolProgress;
+    }
+  | {
+      type: "tool_lifecycle";
+      name: string;
+      argumentsText: string;
+      taskId: string;
+      toolCallId: string;
+      lifecycle: ToolLifecycleEvent;
+    }
+  | {
+      type: "harness_error";
+      name: string;
+      argumentsText: string;
+      taskId: string;
+      toolCallId: string;
+      error: HarnessError;
+      decision?: HarnessRecoveryDecision;
     }
   | ({ type: "agent_status" } & AgentStatusUpdate);
 
@@ -71,22 +103,29 @@ export class StreamingToolExecutor {
     };
 
     const start = (toolCall: ChatToolCall, index: number): void => {
-      const safe = this.tools.isConcurrencySafe(
-        toolCall.name,
-        toolCall.arguments,
-      );
+      const metadata = this.tools.describeCall(toolCall.name, toolCall.arguments);
+      const safe = metadata.concurrencySafe;
       emit({
         type: "tool_started",
         name: toolCall.name,
         argumentsText: toolCall.arguments,
         toolCallId: toolCall.id,
+        source: metadata.source,
+        readOnly: metadata.readOnly,
+        destructive: metadata.destructive,
+        concurrencySafe: metadata.concurrencySafe,
+        interruptBehavior: metadata.interruptBehavior,
+        paths: metadata.paths,
+        activityDescription: metadata.activityDescription,
+        toolUseSummary: metadata.toolUseSummary,
       });
 
       const context = {
         runId: options.runId,
         turn: options.turn,
         toolCallId: toolCall.id,
-        signal: options.signal,
+        signal: metadata.interruptBehavior === "cancel" ? options.signal : undefined,
+        queued: true,
         emitAgentStatus: (update: AgentStatusUpdate) =>
           emit({ type: "agent_status", ...update }),
         emitProgress: (progress: ToolProgress) =>
@@ -98,17 +137,46 @@ export class StreamingToolExecutor {
             toolCallId: toolCall.id,
             progress,
           }),
+        emitLifecycle: (lifecycle: ToolLifecycleEvent) =>
+          emit({
+            type: "tool_lifecycle",
+            name: toolCall.name,
+            argumentsText: toolCall.arguments,
+            taskId: lifecycle.taskId ?? toolCall.id,
+            toolCallId: toolCall.id,
+            lifecycle,
+          }),
       };
 
       const settlement = this.tools
         .execute(toolCall.name, toolCall.arguments, context)
-        .catch((error): ToolExecutionOutcome => ({
-          ok: false,
-          content: `Tool error: ${error instanceof Error ? error.message : String(error)}`,
-          taskId: `tool-${randomUUID()}`,
-          status: "failed",
-        }))
+        .catch((error): ToolExecutionOutcome => {
+          const harnessError = normalizeHarnessError(error, {
+            code: "tool_executor_failure",
+            layer: "tool",
+            phase: "streaming_executor",
+            scope: "tool",
+            details: { tool: toolCall.name },
+          });
+          return {
+            ok: false,
+            content: `Tool error: ${harnessError.message}`,
+            taskId: `tool-${randomUUID()}`,
+            status: "failed",
+            harnessError,
+          };
+        })
         .then((outcome) => {
+          if (outcome.harnessError) {
+            emit({
+              type: "harness_error",
+              name: toolCall.name,
+              argumentsText: toolCall.arguments,
+              taskId: outcome.taskId,
+              toolCallId: toolCall.id,
+              error: outcome.harnessError,
+            });
+          }
           emit({
             type: "tool_result",
             name: toolCall.name,
@@ -117,6 +185,14 @@ export class StreamingToolExecutor {
             toolCallId: toolCall.id,
             ok: outcome.ok,
             result: outcome.content,
+            source: metadata.source,
+            readOnly: metadata.readOnly,
+            destructive: metadata.destructive,
+            concurrencySafe: metadata.concurrencySafe,
+            interruptBehavior: metadata.interruptBehavior,
+            paths: metadata.paths,
+            activityDescription: metadata.activityDescription,
+            toolUseSummary: metadata.toolUseSummary,
           });
           return outcome;
         });
@@ -134,14 +210,30 @@ export class StreamingToolExecutor {
     const run = async (): Promise<void> => {
       for (let index = 0; index < toolCalls.length; index += 1) {
         const toolCall = toolCalls[index]!;
-        const safe = this.tools.isConcurrencySafe(
+        const metadata = this.tools.describeCall(
           toolCall.name,
           toolCall.arguments,
         );
+        const safe = metadata.concurrencySafe;
         const canStartAlongsideCurrent = safe && executing.every((entry) => entry.safe);
         if (!canStartAlongsideCurrent && executing.length > 0) {
           await Promise.all(executing.map((entry) => entry.promise));
         }
+        emit({
+          type: "tool_lifecycle",
+          name: toolCall.name,
+          argumentsText: toolCall.arguments,
+          taskId: toolCall.id,
+          toolCallId: toolCall.id,
+          lifecycle: {
+            taskId: toolCall.id,
+            stage: "tool_queued",
+            ok: true,
+            detail: metadata.concurrencySafe
+              ? "ready to run concurrently"
+              : "waiting for exclusive execution",
+          },
+        });
         start(toolCall, index);
       }
       if (executing.length > 0) {
@@ -151,6 +243,23 @@ export class StreamingToolExecutor {
 
     void run().catch((error) => {
       runnerError = error;
+      emit({
+        type: "harness_error",
+        name: "tool_executor",
+        argumentsText: "",
+        taskId: `executor-${randomUUID()}`,
+        toolCallId: "",
+        error: normalizeHarnessError(error, {
+          code: "tool_batch_failure",
+          layer: "tool",
+          phase: "batch_scheduler",
+          scope: "turn",
+        }),
+        decision: {
+          action: "abort",
+          reason: "tool batch scheduler failed",
+        },
+      });
     }).finally(() => {
       finished = true;
       const pending = wake;

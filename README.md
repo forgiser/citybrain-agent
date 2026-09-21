@@ -8,15 +8,14 @@ uncomment the following block.
 </p>
 -->
 
-<p align="center">
-  <a href="#中文">中文</a>
-  ·
-  <a href="#english">English</a>
-</p>
-
 # CityBrain
 
-## 中文
+<p align="center">
+  <strong>Language / 语言</strong>
+</p>
+
+<details open>
+<summary><strong>中文</strong></summary>
 
 CityBrain 是一个面向城市数据分析的 TypeScript CLI Agent。项目以
 `qgis_process` 为主要空间分析执行入口，通过一个类似 Pi Agent / Claude
@@ -286,7 +285,10 @@ set CITYBRAIN_AGENT_DIR=D:\citybrain-config
 5. 完善 artifact 路由、任务目录和数据血缘；
 6. 增加更强的进程级 QGIS 隔离能力。
 
-## English
+</details>
+
+<details>
+<summary><strong>English</strong></summary>
 
 CityBrain is a TypeScript CLI Agent for urban data analysis. It uses
 `qgis_process` as the primary spatial-processing entry point and combines a
@@ -537,3 +539,5 @@ Next directions:
 4. add an explicit `/profile refresh` command;
 5. improve artifact routing, task directories, and lineage;
 6. add stronger process-level isolation for QGIS jobs.
+
+</details>

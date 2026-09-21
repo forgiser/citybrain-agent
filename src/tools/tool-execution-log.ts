@@ -1,5 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { ResolvedToolMetadata } from "./tool-contract.js";
+import type { HumanInteractionEvent } from "../harness/human-interaction.js";
 
 const MAX_ARGUMENT_TEXT = 12_000;
 const MAX_RESULT_TEXT = 12_000;
@@ -15,7 +17,7 @@ export interface ToolExecutionLogContext {
 export interface ToolExecutionLogEvent {
   schemaVersion: 1;
   timestamp: string;
-  phase: "start" | "progress" | "artifact" | "finish";
+  phase: "start" | "progress" | "artifact" | "lifecycle" | "finish";
   executionId: string;
   tool: string;
   runId?: string;
@@ -31,6 +33,28 @@ export interface ToolExecutionLogEvent {
   error?: string;
   progress?: unknown;
   artifactPaths?: string[];
+  toolSource?: string;
+  readOnly?: boolean;
+  destructive?: boolean;
+  concurrencySafe?: boolean;
+  interruptBehavior?: "cancel" | "block";
+  toolPaths?: string[];
+  toolUseSummary?: string;
+  resultTruncated?: boolean;
+  stage?: string;
+  detail?: string;
+  decisionAction?: "allow" | "deny" | "ask";
+  decisionSource?: string;
+  audit?: Record<string, unknown>;
+  errorCode?: string;
+  errorCategory?: string;
+  errorLayer?: string;
+  errorScope?: string;
+  recovery?: string;
+  humanRequestId?: string;
+  humanKind?: string;
+  humanDecision?: string;
+  humanSource?: string;
 }
 
 export interface HarnessStateLogEvent {
@@ -76,6 +100,7 @@ export class ToolExecutionLogger {
     argumentsText: string,
     args: unknown,
     context?: ToolExecutionLogContext,
+    metadata?: ResolvedToolMetadata,
   ): Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp"> {
     return {
       phase: "start",
@@ -84,6 +109,19 @@ export class ToolExecutionLogger {
       ...context,
       argumentsText: truncate(argumentsText, MAX_ARGUMENT_TEXT),
       arguments: sanitize(args),
+      ...(metadata
+        ? {
+            toolSource: metadata.source,
+            readOnly: metadata.readOnly,
+            destructive: metadata.destructive,
+            concurrencySafe: metadata.concurrencySafe,
+            interruptBehavior: metadata.interruptBehavior,
+            ...(metadata.paths ? { toolPaths: metadata.paths } : {}),
+            ...(metadata.toolUseSummary
+              ? { toolUseSummary: truncate(metadata.toolUseSummary, 2_000) }
+              : {}),
+          }
+        : {}),
     };
   }
 
@@ -95,6 +133,7 @@ export class ToolExecutionLogger {
     result: string,
     context?: ToolExecutionLogContext,
     status?: string,
+    resultTruncated = false,
   ): Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp"> {
     return {
       phase: "finish",
@@ -107,6 +146,7 @@ export class ToolExecutionLogger {
       ...(ok
         ? { result: truncate(result, MAX_RESULT_TEXT) }
         : { error: truncate(result, MAX_RESULT_TEXT) }),
+      ...(resultTruncated ? { resultTruncated: true } : {}),
     };
   }
 
@@ -122,6 +162,94 @@ export class ToolExecutionLogger {
       tool,
       ...context,
       progress: sanitize(progress),
+    };
+  }
+
+  static createLifecycleEvent(
+    executionId: string,
+    tool: string,
+    stage: string,
+    context?: ToolExecutionLogContext,
+    ok = true,
+    detail?: string,
+    decision?: {
+      action: "allow" | "deny" | "ask";
+      source: string;
+    },
+    audit?: Record<string, unknown>,
+  ): Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp"> {
+    return {
+      phase: "lifecycle",
+      executionId,
+      tool,
+      ...context,
+      stage,
+      ok,
+      ...(detail ? { detail: truncate(detail, 4_000) } : {}),
+      ...(decision
+        ? {
+            decisionAction: decision.action,
+            decisionSource: decision.source,
+          }
+        : {}),
+      ...(audit ? { audit: sanitize(audit) as Record<string, unknown> } : {}),
+    };
+  }
+
+  static createHarnessErrorEvent(
+    executionId: string,
+    tool: string,
+    error: {
+      code: string;
+      category: string;
+      layer: string;
+      scope: string;
+      recovery: string;
+      message: string;
+    },
+    context?: ToolExecutionLogContext,
+  ): Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp"> {
+    return {
+      phase: "lifecycle",
+      executionId,
+      tool,
+      ...context,
+      stage: "harness_error",
+      ok: false,
+      detail: truncate(error.message, 4_000),
+      errorCode: error.code,
+      errorCategory: error.category,
+      errorLayer: error.layer,
+      errorScope: error.scope,
+      recovery: error.recovery,
+    };
+  }
+
+  static createHumanInteractionEvent(
+    event: HumanInteractionEvent,
+  ): Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp"> {
+    const request = event.request;
+    const decision = "decision" in event ? event.decision : undefined;
+    return {
+      phase: "lifecycle",
+      executionId: request.requestId,
+      tool: `human:${request.kind}`,
+      runId: request.runId,
+      turn: request.turn,
+      stage: `human_${event.type}`,
+      ok: event.type === "created" || event.type === "resolved",
+      detail: truncate(
+        decision?.reason ?? request.message,
+        MAX_RESULT_TEXT,
+      ),
+      humanRequestId: request.requestId,
+      humanKind: request.kind,
+      ...(decision
+        ? {
+            humanDecision: decision.optionId ?? decision.action,
+            humanSource: decision.source,
+          }
+        : {}),
     };
   }
 

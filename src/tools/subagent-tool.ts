@@ -14,6 +14,7 @@ import { ToolExecutionLogger } from "./tool-execution-log.js";
 import type { ToolCallContext } from "./tool-registry.js";
 import { ToolRegistry } from "./tool-registry.js";
 import type { SandboxPolicy } from "../workspace/sandbox-policy.js";
+import type { HumanInteractionBroker } from "../harness/human-interaction.js";
 
 /**
  * Dependencies the delegate tool needs to spawn an isolated subagent loop. The
@@ -31,6 +32,7 @@ export interface SubagentToolDeps {
   getQgisRuntime: () => QgisRuntimeInfo | undefined;
   toolLogger?: ToolExecutionLogger;
   contextLogger?: ContextUsageLogger;
+  humanInteractionBroker?: HumanInteractionBroker;
   /** Optional run options forwarded to the subagent loop's stream (thinkingLevel, etc). */
   options?: StreamChatOptions;
 }
@@ -84,31 +86,81 @@ export function createSubagentTool(
     const registry = new ToolRegistry({
       logger: deps.toolLogger,
       sandbox: deps.getSandboxPolicy,
+      permission: {
+        humanInteractionBroker: deps.humanInteractionBroker,
+      },
     });
     registry.register(
       readFileToolDefinition,
       (args, toolContext) => executeReadFile(args, deps.getCwd(), toolContext),
-      { isConcurrencySafe: () => true },
+      {
+        source: "builtin",
+        isReadOnly: () => true,
+        isDestructive: () => false,
+        isConcurrencySafe: () => true,
+        interruptBehavior: "cancel",
+        getPath: getSinglePath,
+        getReadPaths: getSinglePath,
+        getActivityDescription: () => "Reading file",
+        getToolUseSummary: getSinglePath,
+        maxResultSizeChars: 20_000,
+      },
     );
     registry.register(
       listFilesToolDefinition,
       (args, toolContext) =>
         executeListFiles(args, deps.getCwd(), toolContext?.sandbox),
-      { isConcurrencySafe: () => true },
+      {
+        source: "builtin",
+        isReadOnly: () => true,
+        isDestructive: () => false,
+        isConcurrencySafe: () => true,
+        interruptBehavior: "cancel",
+        getPath: getSinglePath,
+        getReadPaths: getSinglePath,
+        getActivityDescription: () => "Listing files",
+        getToolUseSummary: (args) => getSinglePath(args) ?? ".",
+        maxResultSizeChars: 20_000,
+      },
     );
     registry.register(
       writeFileToolDefinition,
       (args, toolContext) => executeWriteFile(args, toolContext),
-      { isConcurrencySafe: () => false },
+      {
+        source: "builtin",
+        isReadOnly: () => false,
+        isDestructive: () => true,
+        isConcurrencySafe: () => false,
+        interruptBehavior: "block",
+        getPath: getSinglePath,
+        getWritePaths: getSinglePath,
+        getActivityDescription: () => "Writing file",
+        getToolUseSummary: getSinglePath,
+        maxResultSizeChars: 20_000,
+        requiresUserInteraction: () => true,
+      },
     );
     registry.register(
       editFileToolDefinition,
       (args, toolContext) => executeEditFile(args, toolContext),
-      { isConcurrencySafe: () => false },
+      {
+        source: "builtin",
+        isReadOnly: () => false,
+        isDestructive: () => true,
+        isConcurrencySafe: () => false,
+        interruptBehavior: "block",
+        getPath: getSinglePath,
+        getWritePaths: getSinglePath,
+        getActivityDescription: () => "Editing file",
+        getToolUseSummary: getSinglePath,
+        maxResultSizeChars: 20_000,
+        requiresUserInteraction: () => true,
+      },
     );
     for (const tool of createQgisTools(runtime)) {
       registry.register(tool.definition, tool.handler, {
-        isConcurrencySafe: tool.isConcurrencySafe,
+        ...tool.metadata,
+        producesArtifacts: tool.producesArtifacts,
       });
     }
     return registry;
@@ -150,6 +202,7 @@ export function createSubagentTool(
             artifactSummary: formatArtifactSummary(childTools.artifacts.snapshot()),
           };
         },
+        deps.humanInteractionBroker,
       );
 
       // Surface the subagent's token usage up as it streams, so the UI can
@@ -208,4 +261,17 @@ function formatArtifactSummary(
       return `- ${record.status} ${record.path} (task ${record.producerTaskId})${error}`;
     })
     .join("\n");
+}
+
+function getSinglePath(args: unknown): string | undefined {
+  if (
+    typeof args === "object" &&
+    args !== null &&
+    !Array.isArray(args) &&
+    typeof (args as { path?: unknown }).path === "string"
+  ) {
+    const path = (args as { path: string }).path.trim();
+    return path || undefined;
+  }
+  return undefined;
 }

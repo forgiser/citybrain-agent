@@ -8,7 +8,10 @@ import {
   executeQgisAlgorithm,
   listQgisAlgorithms,
 } from "./qgis-process-client.js";
-import type { ToolCallContext } from "../tools/tool-registry.js";
+import type {
+  ToolCallContext,
+  ToolRegistrationOptions,
+} from "../tools/tool-registry.js";
 
 export interface QgisTool {
   definition: ChatToolDefinition;
@@ -19,8 +22,8 @@ export interface QgisTool {
    * files) and executes exclusively. A path-collision-aware refinement —
    * parallel runs with distinct OUTPUT paths — is a later refinement.
    */
-  isConcurrencySafe?: (args: unknown) => boolean;
   producesArtifacts?: (args: unknown, context?: ToolCallContext) => string[];
+  metadata?: ToolRegistrationOptions;
 }
 
 type RuntimeGetter = () => QgisRuntimeInfo | undefined;
@@ -75,7 +78,19 @@ function makeListTool(getRuntime: RuntimeGetter): QgisTool {
       const notice = result.truncated ? "[List truncated - refine the filter keyword.]" : "";
       return [header, ...lines, notice].filter(Boolean).join("\n");
     },
-    isConcurrencySafe: () => true,
+    metadata: {
+      source: "qgis",
+      isReadOnly: () => true,
+      isDestructive: () => false,
+      isConcurrencySafe: () => true,
+      interruptBehavior: "cancel",
+      getActivityDescription: () => "Searching QGIS algorithms",
+      getToolUseSummary: (args) => {
+        const filter = getStringField(args, "filter");
+        return filter ? `filter=${filter}` : "algorithm catalog";
+      },
+      maxResultSizeChars: 20_000,
+    },
   };
 }
 
@@ -106,7 +121,16 @@ function makeDescribeTool(getRuntime: RuntimeGetter): QgisTool {
       const runtime = requireRuntime(getRuntime());
       return describeQgisAlgorithm(runtime, getAlgorithmId(args));
     },
-    isConcurrencySafe: () => true,
+    metadata: {
+      source: "qgis",
+      isReadOnly: () => true,
+      isDestructive: () => false,
+      isConcurrencySafe: () => true,
+      interruptBehavior: "cancel",
+      getActivityDescription: () => "Describing QGIS algorithm",
+      getToolUseSummary: (args) => getStringField(args, "algorithm") ?? "algorithm",
+      maxResultSizeChars: 20_000,
+    },
   };
 }
 
@@ -238,10 +262,31 @@ function makeRunTool(getRuntime: RuntimeGetter): QgisTool {
       }
       return parts.join("\n");
     },
-    // Side effects (writes output files). Exclusive until path-collision-aware
-    // refinement lands (parallel runs with distinct OUTPUT paths).
-    isConcurrencySafe: () => false,
+    // The shared ToolMetadata contract makes this decision from the parsed
+    // algorithm call. Unknown or write-producing algorithms stay exclusive.
     producesArtifacts: getQgisOutputPaths,
+    metadata: {
+      source: "qgis",
+      isReadOnly: () => false,
+      isDestructive: (args) => getQgisOutputPaths(args).length > 0,
+      isConcurrencySafe: isQgisAlgorithmConcurrencySafe,
+      interruptBehavior: "block",
+      getPath: getQgisInputPaths,
+      getReadPaths: getQgisInputPaths,
+      getWritePaths: getQgisOutputParameterPaths,
+      getActivityDescription: (args) => {
+        const algorithm = getStringField(args, "algorithm");
+        return algorithm ? `Running QGIS ${algorithm}` : "Running QGIS algorithm";
+      },
+      getToolUseSummary: (args) => {
+        const algorithm = getStringField(args, "algorithm");
+        const outputs = getQgisOutputPaths(args);
+        return [algorithm, outputs.length > 0 ? `output=${outputs[0]}` : undefined]
+          .filter(Boolean)
+          .join(" ") || "algorithm";
+      },
+      maxResultSizeChars: 20_000,
+    },
   };
 }
 
@@ -254,6 +299,27 @@ function requireRuntime(runtime: QgisRuntimeInfo | undefined): QgisRuntimeInfo {
     throw new Error("QGIS runtime is not configured. Ask the user to run /qgis to set it up.");
   }
   return runtime;
+}
+
+/**
+ * Conservative QGIS parallelism policy.
+ *
+ * QGIS exposes hundreds of algorithms and their side effects are not encoded
+ * uniformly in qgis_process output. Keep the default exclusive and explicitly
+ * allow algorithms whose contract is read-only and does not produce a file.
+ */
+function isQgisAlgorithmConcurrencySafe(args: unknown): boolean {
+  const algorithm = getStringField(args, "algorithm")?.toLowerCase();
+  if (!algorithm || getQgisOutputPaths(args).length > 0) return false;
+
+  return new Set([
+    "gdal:gdalinfo",
+    "gdal:ogrinfo",
+    "native:basicstatisticsforfields",
+    "native:basicstatisticsforrasterlayer",
+    "native:rasterlayerstatistics",
+    "native:vectorlayerhistogram",
+  ]).has(algorithm);
 }
 
 function getAlgorithmId(args: unknown): string {
@@ -339,6 +405,39 @@ function getQgisOutputPaths(args: unknown, context?: ToolCallContext): string[] 
     );
   }
   return paths;
+}
+
+function getQgisOutputParameterPaths(args: unknown): string[] {
+  if (!isRecord(args) || !isRecord(args.parameters)) return [];
+  return Object.entries(args.parameters)
+    .filter(([key, value]) =>
+      /^OUTPUT(?:_|$)/iu.test(key) &&
+      typeof value === "string" &&
+      value.trim() &&
+      !/^TEMPORARY_OUTPUT$/iu.test(value.trim()),
+    )
+    .map(([, value]) => value as string);
+}
+
+function getQgisInputPaths(args: unknown): string[] {
+  if (!isRecord(args) || !isRecord(args.parameters)) return [];
+  return Object.entries(args.parameters)
+    .filter(([key, value]) =>
+      !/^OUTPUT(?:_|$)/iu.test(key) &&
+      typeof value === "string" &&
+      (isPathParameterKey(key) || WINDOWS_ABSOLUTE_PATH.test(value)),
+    )
+    .map(([, value]) => value as string);
+}
+
+function getStringField(args: unknown, key: string): string | undefined {
+  return isRecord(args) && typeof args[key] === "string"
+    ? args[key] as string
+    : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function resolveWorkspacePath(value: string): string {

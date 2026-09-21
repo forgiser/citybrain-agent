@@ -47,6 +47,8 @@ import {
   type ToolExecutionResult,
   type ToolExecutionStarted,
 } from "../tools/streaming-tool-executor.js";
+import { HarnessController } from "../harness/index.js";
+import type { HumanInteractionBroker } from "../harness/human-interaction.js";
 export type { ToolProgress } from "../tools/tool-registry.js";
 export type {
   ToolExecutionResult,
@@ -86,6 +88,7 @@ export class AgentLoop {
     private readonly contextLogger?: ContextUsageLogger,
     private readonly contextTraceLogger?: ContextTraceLogger,
     private readonly getContextInputs?: () => ContextBuildInputs,
+    private readonly humanInteractionBroker?: HumanInteractionBroker,
   ) {
     this.streamingToolExecutor = new StreamingToolExecutor(tools);
   }
@@ -101,6 +104,59 @@ export class AgentLoop {
     options: StreamChatOptions = {},
   ): AsyncGenerator<AgentEvent, string, undefined> {
     const runId = randomUUID();
+    const harness = new HarnessController({
+      runId,
+      humanInteractionBroker: this.humanInteractionBroker,
+      onEvent: (event) => {
+        if (event.type === "state") {
+          void this.logger?.recordHarnessState(
+            event.runId,
+            event.turn,
+            event.state,
+            event.previousState,
+            event.reason,
+          );
+          return;
+        }
+        if (event.type === "error") {
+          void this.logger?.record(
+            ToolExecutionLogger.createHarnessErrorEvent(
+              `harness-${runId}`,
+              "harness",
+              event.error,
+              { runId, turn: event.turn },
+            ),
+          );
+          return;
+        }
+        void this.logger?.record(
+          ToolExecutionLogger.createLifecycleEvent(
+            `harness-${runId}`,
+            "harness",
+            "recovery_decision",
+            { runId, turn: event.turn },
+            true,
+            event.decision.reason,
+          ),
+        );
+      },
+    });
+    const unsubscribeHuman = this.humanInteractionBroker?.subscribe((event) => {
+      if (event.request.runId !== runId) return;
+      harness.setTurn(turn);
+      if (event.type === "created") {
+        if (harness.canTransition("waiting_for_human")) {
+          harness.transition("waiting_for_human", event.request.message);
+        }
+        return;
+      }
+      if (harness.canTransition("resuming")) {
+        harness.transition("resuming", `human decision: ${event.decision.action}`);
+      }
+      if (harness.canTransition("executing")) {
+        harness.transition("executing", "resuming after human decision");
+      }
+    });
     let state: AgentHarnessState = "idle";
     let turn = 0;
     let toolTurnCount = 0;
@@ -133,12 +189,28 @@ export class AgentLoop {
       return { type: "state", ...update };
     };
 
+    const syncHarnessState = (
+      next:
+        | "planning"
+        | "executing"
+        | "finalizing"
+        | "completed"
+        | "failed"
+        | "aborted",
+      reason?: string,
+    ): void => {
+      harness.setTurn(turn);
+      if (harness.state === next || !harness.canTransition(next)) return;
+      harness.transition(next, reason);
+    };
+
     const publishContext = (snapshot: ContextUsageSnapshot): AgentEvent => {
       void this.contextLogger?.record(snapshot);
       return { type: "context", snapshot };
     };
 
     try {
+      syncHarnessState("planning", "run started");
       const model =
         this.modelRuntime.getSelectedModel() ??
         this.modelRuntime.ensureSelection();
@@ -213,6 +285,7 @@ export class AgentLoop {
         ];
 
         if (finalizationRequested) {
+          syncHarnessState("finalizing", finalizationReason);
           yield transition("finalizing", finalizationReason);
         }
         yield transition(
@@ -336,6 +409,7 @@ export class AgentLoop {
               finalizationReason,
             );
           }
+          syncHarnessState("completed", "final answer received");
           yield transition("completed", "final answer received");
           break;
         }
@@ -345,6 +419,7 @@ export class AgentLoop {
             toolHistory,
             "model attempted another tool call during finalization",
           );
+          syncHarnessState("completed", "finalization fallback used");
           yield transition("completed", "finalization fallback used");
           break;
         }
@@ -381,6 +456,7 @@ export class AgentLoop {
           "waiting_for_tools",
           `${resolvedToolCalls.length} tool call(s) received`,
         );
+        syncHarnessState("executing", "tool batch received");
         yield transition("executing_tools");
         const outcomes = yield* this.executeToolTurn(
           resolvedToolCalls,
@@ -404,6 +480,11 @@ export class AgentLoop {
             toolCallId: toolCall.id,
             toolName: toolCall.name,
           });
+          if (outcome.preventContinuation) {
+            finalizationRequested = true;
+            finalizationReason =
+              "a tool hook requested finalization after tool execution";
+          }
         }
 
         toolTurnCount += 1;
@@ -433,14 +514,33 @@ export class AgentLoop {
         thinking: finalThinking || undefined,
         usage: latestUsage,
       });
+      syncHarnessState("completed", "final answer persisted");
       return finalResponse;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failedState = message.toLowerCase().includes("abort")
+      const failedState: "aborted" | "failed" = message.toLowerCase().includes("abort")
         ? "aborted"
         : "failed";
+      const reported = harness.report(error, {
+        layer: "agent_loop",
+        phase: "run",
+        scope: "run",
+        details: { state, turn },
+      });
+      syncHarnessState(failedState, reported.decision.reason);
+      yield {
+        type: "harness_error",
+        name: "harness",
+        argumentsText: "",
+        taskId: `harness-${runId}`,
+        toolCallId: "",
+        error: reported.error,
+        decision: reported.decision,
+      };
       yield transition(failedState, message);
       throw error;
+    } finally {
+      unsubscribeHuman?.();
     }
   }
 

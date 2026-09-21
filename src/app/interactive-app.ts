@@ -29,6 +29,11 @@ import type {
 } from "../agent/agent-loop.js";
 import type { AgentStatusUpdate } from "../agent/agent-status.js";
 import type { AgentHarnessStateUpdate } from "../agent/agent-state.js";
+import type { HarnessError } from "../harness/harness-types.js";
+import {
+  HumanInteractionBroker,
+  type HumanInteractionRequest,
+} from "../harness/human-interaction.js";
 import type { ContextUsageSnapshot } from "../context/context-usage.js";
 import { AuthStorage } from "../auth/auth-storage.js";
 import { LoginDialog } from "../auth/login-dialog.js";
@@ -100,6 +105,7 @@ import {
   SandboxPolicy,
 } from "../workspace/sandbox-policy.js";
 import { findShellCommand, shellCommands } from "./shell-commands.js";
+import { CliHumanInteractionAdapter } from "./cli-human-interaction.js";
 
 const VERSION = "0.1.0";
 const DEFAULT_THINKING_LEVEL: ThinkingLevel = "high";
@@ -134,6 +140,8 @@ const colors = {
   toolErrorText: (text: string) => fgRgb(196, 143, 143, text),
   toolTitle: (text: string) => styleText("bold", fgRgb(224, 221, 216, text)),
   toolPath: (text: string) => underline(fgRgb(139, 193, 187, text)),
+  humanBackground: (text: string) => bgRgb(63, 57, 35, text),
+  humanText: (text: string) => fgRgb(232, 216, 151, text),
   agentTitle: (text: string) => styleText("bold", fgRgb(151, 199, 242, text)),
   agentRunningBackground: (text: string) => bgRgb(38, 52, 68, text),
   agentRunningText: (text: string) => styleText("yellow", text),
@@ -162,9 +170,15 @@ export async function startInteractiveApp(): Promise<void> {
   let session = SessionManager.create(process.cwd());
   let qgisRuntime = await detectQgisRuntime();
   let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
+  const humanBroker = new HumanInteractionBroker({
+    defaultTimeoutMs: 5 * 60 * 1_000,
+  });
   const toolLogger = new ToolExecutionLogger(
     () => join(session.getWorkspaceDir(), ".internal", "logs", "tool-execution.jsonl"),
   );
+  humanBroker.subscribe((event) => {
+    void toolLogger.record(ToolExecutionLogger.createHumanInteractionEvent(event));
+  });
   const contextLogger = new ContextUsageLogger(
     () => join(session.getWorkspaceDir(), ".internal", "logs", "context-usage.jsonl"),
   );
@@ -173,6 +187,9 @@ export async function startInteractiveApp(): Promise<void> {
   );
   const toolRegistry = new ToolRegistry({
     logger: toolLogger,
+    permission: {
+      humanInteractionBroker: humanBroker,
+    },
     sandbox: () =>
       SandboxPolicy.fromWorkspace(
         session.getWorkspaceDir(),
@@ -183,27 +200,74 @@ export async function startInteractiveApp(): Promise<void> {
     readFileToolDefinition,
     (args, toolContext) =>
       executeReadFile(args, session.getProjectDir(), toolContext),
-    { isConcurrencySafe: () => true },
+    {
+      source: "builtin",
+      isReadOnly: () => true,
+      isDestructive: () => false,
+      isConcurrencySafe: () => true,
+      interruptBehavior: "cancel",
+      getPath: getSinglePath,
+      getReadPaths: getSinglePath,
+      getActivityDescription: () => "Reading file",
+      getToolUseSummary: getSinglePath,
+      maxResultSizeChars: 20_000,
+    },
   );
   toolRegistry.register(
     listFilesToolDefinition,
     (args, toolContext) =>
       executeListFiles(args, session.getProjectDir(), toolContext?.sandbox),
-    { isConcurrencySafe: () => true },
+    {
+      source: "builtin",
+      isReadOnly: () => true,
+      isDestructive: () => false,
+      isConcurrencySafe: () => true,
+      interruptBehavior: "cancel",
+      getPath: getSinglePath,
+      getReadPaths: getSinglePath,
+      getActivityDescription: () => "Listing files",
+      getToolUseSummary: (args) => getSinglePath(args) ?? ".",
+      maxResultSizeChars: 20_000,
+    },
   );
   toolRegistry.register(
     writeFileToolDefinition,
     (args, toolContext) => executeWriteFile(args, toolContext),
-    { isConcurrencySafe: () => false },
+    {
+      source: "builtin",
+      isReadOnly: () => false,
+      isDestructive: () => true,
+      isConcurrencySafe: () => false,
+      interruptBehavior: "block",
+      getPath: getSinglePath,
+      getWritePaths: getSinglePath,
+      getActivityDescription: () => "Writing file",
+      getToolUseSummary: getSinglePath,
+      maxResultSizeChars: 20_000,
+      requiresUserInteraction: () => true,
+    },
   );
   toolRegistry.register(
     editFileToolDefinition,
     (args, toolContext) => executeEditFile(args, toolContext),
-    { isConcurrencySafe: () => false },
+    {
+      source: "builtin",
+      isReadOnly: () => false,
+      isDestructive: () => true,
+      isConcurrencySafe: () => false,
+      interruptBehavior: "block",
+      getPath: getSinglePath,
+      getWritePaths: getSinglePath,
+      getActivityDescription: () => "Editing file",
+      getToolUseSummary: getSinglePath,
+      maxResultSizeChars: 20_000,
+      requiresUserInteraction: () => true,
+    },
   );
   for (const tool of createQgisTools(() => qgisRuntime)) {
     toolRegistry.register(tool.definition, tool.handler, {
-      isConcurrencySafe: tool.isConcurrencySafe,
+      ...tool.metadata,
+      producesArtifacts: tool.producesArtifacts,
     });
   }
   const delegateTool = createSubagentTool({
@@ -218,10 +282,21 @@ export async function startInteractiveApp(): Promise<void> {
     getQgisRuntime: () => qgisRuntime,
     toolLogger,
     contextLogger,
+    humanInteractionBroker: humanBroker,
     options: { thinkingLevel },
   });
   toolRegistry.register(delegateTool.definition, delegateTool.handler, {
     isConcurrencySafe: delegateTool.isConcurrencySafe,
+    source: "subagent",
+    isReadOnly: () => false,
+    isDestructive: () => false,
+    interruptBehavior: "block",
+    getActivityDescription: () => "Delegating subtask",
+    getToolUseSummary: (args) =>
+      isPlainObject(args) && typeof args.description === "string"
+        ? args.description
+        : "subagent",
+    maxResultSizeChars: 20_000,
   });
   const agentLoop = new AgentLoop(
     modelRuntime,
@@ -238,6 +313,7 @@ export async function startInteractiveApp(): Promise<void> {
       artifactSummary: formatArtifactSummary(toolRegistry.artifacts.snapshot()),
       additionalWorkingDirectories: [session.getWorkspaceDir()],
     }),
+    humanBroker,
   );
   const terminal = new ProcessTerminal();
   const tui: TUI = new TuiMainScreen(terminal, true);
@@ -247,6 +323,29 @@ export async function startInteractiveApp(): Promise<void> {
   });
   editor.borderColor = getThinkingBorderColor(thinkingLevel);
   const transcript: Component[] = [];
+  const humanPrompts = new Map<string, HumanInteractionComponent>();
+  const humanInteraction = new CliHumanInteractionAdapter(humanBroker, {
+    show: (request) => {
+      const component = new HumanInteractionComponent(
+        request,
+        getInitialHumanSelection(request),
+      );
+      humanPrompts.set(request.requestId, component);
+      addTranscript({ editor, transcript, tui }, component);
+    },
+    select: (request, index) => {
+      humanPrompts.get(request.requestId)?.setSelectedIndex(index);
+    },
+    remove: (request) => {
+      const component = humanPrompts.get(request.requestId);
+      if (!component) return;
+      tui.removeChild(component);
+      const index = transcript.indexOf(component);
+      if (index >= 0) transcript.splice(index, 1);
+      humanPrompts.delete(request.requestId);
+    },
+    requestRender: () => tui.requestRender(),
+  });
   const modelStatus = new FooterStatus();
   const agentStatusFooter = new AgentStatusFooter();
   const sandboxStatus = new SandboxStatus();
@@ -284,6 +383,8 @@ export async function startInteractiveApp(): Promise<void> {
     const stop = (): void => {
       if (stopped) return;
       stopped = true;
+      humanBroker.cancelAll("application stopped");
+      humanInteraction.dispose();
       if (ctrlCNoticeTimer) clearTimeout(ctrlCNoticeTimer);
       tui.stop();
       process.stdout.write("\n");
@@ -313,6 +414,9 @@ export async function startInteractiveApp(): Promise<void> {
             tui.requestRender();
           }
         }, 1_000);
+        return { consume: true };
+      }
+      if (humanInteraction.handleInput(data)) {
         return { consume: true };
       }
       return undefined;
@@ -521,6 +625,20 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
         context.tui.requestRender();
         continue;
       }
+      if (event.type === "tool_lifecycle") {
+        if (event.name !== "delegate") {
+          responseComponent.updateToolLifecycle(event);
+        }
+        context.tui.requestRender();
+        continue;
+      }
+      if (event.type === "harness_error") {
+        if (event.name !== "delegate") {
+          responseComponent.setHarnessStatus(formatHarnessErrorStatus(event.error));
+        }
+        context.tui.requestRender();
+        continue;
+      }
       if (event.type === "tool_result") {
         if (event.name !== "delegate") {
           responseComponent.completeTool(event);
@@ -669,6 +787,57 @@ function createUserMessage(input: string): Box {
     new Text(`${colors.userTitle("you")}\n\n${colors.userText(input)}`, 0, 0),
   );
   return userMessage;
+}
+
+class HumanInteractionComponent extends Box {
+  private readonly content: Text;
+  private selectedIndex: number;
+
+  constructor(
+    private readonly request: HumanInteractionRequest,
+    selectedIndex: number,
+  ) {
+    super(1, 1, colors.humanBackground);
+    this.selectedIndex = selectedIndex;
+    this.content = new Text(formatHumanRequest(request, selectedIndex), 0, 0);
+    this.addChild(this.content);
+  }
+
+  setSelectedIndex(index: number): void {
+    this.selectedIndex = index;
+    this.content.setText(formatHumanRequest(this.request, index));
+  }
+}
+
+function getInitialHumanSelection(request: HumanInteractionRequest): number {
+  const defaultIndex = request.options.findIndex(
+    (option) => option.id === request.defaultOption,
+  );
+  return defaultIndex >= 0 ? defaultIndex : 0;
+}
+
+function formatHumanRequest(
+  request: HumanInteractionRequest,
+  selectedIndex: number,
+): string {
+  const options = request.options
+    .map((option, index) => {
+      const description = option.description ? `  ${option.description}` : "";
+      const prefix = index === selectedIndex ? "› " : "  ";
+      const label = index === selectedIndex
+        ? colors.humanText(option.label)
+        : option.label;
+      return `${prefix}${label}${description}`;
+    })
+    .join("\n");
+  return [
+    colors.humanText("human approval required"),
+    colors.humanText(request.title),
+    request.message,
+    colors.dim(`risk=${request.risk ?? "medium"}`),
+    options,
+    colors.dim("Use ↑/↓ to select, Enter to confirm, or Esc to cancel."),
+  ].join("\n");
 }
 
 function createHeader(): Text {
@@ -1973,10 +2142,16 @@ const TOOL_ERROR_LINE_CHARS = 160;
 
 function createToolRunningMessage(event: ToolExecutionStarted): string {
   const target = getToolTarget(event.argumentsText);
+  const summary = event.toolUseSummary ?? target;
+  if (event.activityDescription) {
+    return summary
+      ? `${event.activityDescription}: ${summary}`
+      : event.activityDescription;
+  }
   if (event.name === "read_file") {
     return target ? `Reading file: ${target}` : "Reading file...";
   }
-  return target ? `Running ${event.name}: ${target}` : `Running ${event.name}...`;
+  return summary ? `Running ${event.name}: ${summary}` : `Running ${event.name}...`;
 }
 
 function createToolProgressMessage(name: string, progress: ToolProgress): string {
@@ -1993,19 +2168,47 @@ function createToolProgressMessage(name: string, progress: ToolProgress): string
   return `${colors.dim(`${name} ${phase}${elapsed}`)}${detail}`;
 }
 
+function createToolLifecycleMessage(
+  lifecycle: Extract<AgentEvent, { type: "tool_lifecycle" }>["lifecycle"],
+): string {
+  const labels: Record<string, string> = {
+    tool_resolved: "resolved",
+    tool_validating: "validating input",
+    tool_normalizing: "normalizing input",
+    tool_normalized: "input normalized",
+    pre_tool_hook: "pre-tool hook",
+    sandbox_check: "checking sandbox",
+    policy_check: "checking policy",
+    permission_decision: "permission decision",
+    tool_artifact_preflight: "checking artifacts",
+    tool_queued: "queued",
+    tool_started: "started",
+    tool_completed: "completed",
+    post_tool_hook: "post-tool hook",
+    failure_hook: "failure hook",
+    tool_failed: "failed",
+  };
+  const label = labels[lifecycle.stage] ?? lifecycle.stage;
+  const detail = lifecycle.detail
+    ? `  ${truncateSingleLine(lifecycle.detail, 120)}`
+    : "";
+  return `${colors.dim(label)}${detail}`;
+}
+
 function createToolDisplayText(event: ToolExecutionResult): string {
   const target = getToolTarget(event.argumentsText);
-  const header = createToolHeader(event.name, target);
+  const header = createToolHeader(event.name, target, event.toolUseSummary);
   // Success: header only. Failure: header + one truncated reason line.
   const firstLine = event.result.replace(/^Tool error:\s*/i, "").split("\n")[0]?.trim();
   if (event.ok || !firstLine) return header;
   return `${header}\n${colors.toolErrorText(truncateSingleLine(firstLine, TOOL_ERROR_LINE_CHARS))}`;
 }
 
-function createToolHeader(name: string, target: string): string {
+function createToolHeader(name: string, target: string, summary?: string): string {
   const displayName = name === "read_file" ? "read" : name;
-  if (!target) return colors.toolTitle(displayName);
-  return `${colors.toolTitle(displayName)} ${colors.toolPath(target)}`;
+  const detail = summary || target;
+  if (!detail) return colors.toolTitle(displayName);
+  return `${colors.toolTitle(displayName)} ${colors.toolPath(detail)}`;
 }
 
 function createToolResultComponent(event: ToolExecutionResult): Box {
@@ -2025,7 +2228,11 @@ function createToolRunningComponent(segment: ToolSegment): Box {
     colors.toolSuccessBackground,
   );
   const target = getToolTarget(segment.event.argumentsText);
-  const header = createToolHeader(segment.event.name, target);
+  const header = createToolHeader(
+    segment.event.name,
+    target,
+    segment.event.toolUseSummary,
+  );
   box.addChild(
     new Text(
       `${header}\n${colors.dim(segment.status || "running")}`,
@@ -2068,6 +2275,14 @@ function formatHarnessStatus(state: AgentHarnessStateUpdate): string {
   }
 }
 
+function formatHarnessErrorStatus(error: HarnessError): string {
+  return [
+    colors.red(`harness ${error.category}`),
+    truncateSingleLine(error.message, 140),
+    colors.dim(`recovery=${error.recovery}`),
+  ].join("  ");
+}
+
 function renderAgentStatus(agent: AgentStatusUpdate): string {
   if (agent.status === "running") {
     return colors.agentRunningText(" ● 进行中");
@@ -2098,6 +2313,17 @@ function getToolTarget(argumentsText: string): string {
   } catch {
     return truncateSingleLine(argumentsText, 80);
   }
+}
+
+function getSinglePath(args: unknown): string | undefined {
+  if (
+    isPlainObject(args) &&
+    typeof args.path === "string" &&
+    args.path.trim()
+  ) {
+    return args.path.trim();
+  }
+  return undefined;
 }
 
 function truncateSingleLine(value: string, maxLength: number): string {
@@ -2177,6 +2403,14 @@ class AssistantResponseComponent extends Container {
     const segment = this.findToolSegment(event.toolCallId);
     if (segment) {
       segment.status = createToolProgressMessage(event.name, event.progress);
+    }
+    this.rebuild();
+  }
+
+  updateToolLifecycle(event: Extract<AgentEvent, { type: "tool_lifecycle" }>): void {
+    const segment = this.findToolSegment(event.toolCallId);
+    if (segment) {
+      segment.status = createToolLifecycleMessage(event.lifecycle);
     }
     this.rebuild();
   }
