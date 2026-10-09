@@ -157,6 +157,22 @@ npm install
 npm run dev
 ```
 
+启动时可以选择 CLI 或 Web UI，也可以直接指定：
+
+```cmd
+npm run dev -- --mode cli
+npm run dev -- --mode web
+npm run dev -- --mode web --port 3170 --no-open
+```
+
+Web UI 默认只监听 `127.0.0.1`，页面采用左侧会话/项目目录、中间地图、右侧
+Agent 问答的工作台布局。生产构建会同时生成服务端和 Web 静态资源：
+
+```cmd
+npm run build
+npm start -- --mode web
+```
+
 也可以构建并注册全局命令：
 
 ```cmd

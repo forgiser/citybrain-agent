@@ -2,9 +2,18 @@
 
 ## 1. 文档目的
 
-本文档定义 CityBrain 执行 `/init` 时创建的工作区结构、文件职责、内容格式和生命周期。
+本文档定义 CityBrain 执行 `/workspace <path>` 时创建的工作区结构、文件职责、内容格式和生命周期。
 
-`/init <projectDir>` 中的 `projectDir` 是项目级 Sandbox 根目录，例如
+`/init` 是历史兼容别名，`/sandbox` 是历史兼容命令。新的用户入口统一为 `/workspace`：
+
+```text
+/workspace <path>
+/workspace info
+/workspace add-read <directory>
+/workspace remove-read <directory>
+```
+
+`/workspace <projectDir>` 中的 `projectDir` 是项目级工作区根目录，例如
 `E:\workspace1`。`citybrain/` 是生成在该 Sandbox 内部的 Harness 控制目录，
 用于保存画像、日志、内部状态和推荐的分析产物目录。
 
@@ -30,7 +39,7 @@
 
 ## 2. 工作区目录结构
 
-执行 `/init` 后，目标项目目录下创建：
+执行 `/workspace <projectDir>` 后，目标项目目录下创建：
 
 ```text
 <projectDir>/

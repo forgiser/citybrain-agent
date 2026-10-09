@@ -38,14 +38,9 @@ export const shellCommands: ShellCommand[] = [
     argumentHint: "[setup|detect|list [filter]|info <algo>|use <path>|clear]",
   },
   {
-    name: "/init",
-    description: "初始化 CityBrain 项目工作区（citybrain/ 目录骨架）",
-    argumentHint: "[<target-folder>]",
-  },
-  {
-    name: "/sandbox",
-    description: "查看或配置工作区级 sandbox 读写边界",
-    argumentHint: "[add-read|remove-read <directory>]",
+    name: "/workspace",
+    description: "创建、切换或查看当前 CityBrain 工作区",
+    argumentHint: "[<path>|info|add-read|remove-read]",
   },
   {
     name: "/login",

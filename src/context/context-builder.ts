@@ -68,6 +68,9 @@ export function buildStaticSections(inputs: ContextBuildInputs): SystemPromptSec
     systemPromptSection("tool_semantics", () => getToolSemantics()),
     systemPromptSection("tone", () => getTone()),
     systemPromptSection("output_efficiency", () => getOutputEfficiency()),
+    ...(inputs.hostPrompt?.staticSections ?? []).map((section) =>
+      systemPromptSection(`host:${section.id}`, () => section.content)
+    ),
   ];
 }
 
@@ -98,6 +101,10 @@ function getToolSemantics(): string {
     "read_file    — read a file by absolute path when you need its raw content.",
     "write_file   — create or completely rewrite a workspace text file; read existing files first.",
     "edit_file    — replace an exact unique string in a workspace text file; read it first.",
+    "get_task_status / list_tasks — inspect background work without assuming it is complete.",
+    "wait_task — wait briefly for a background result; a wait timeout does not cancel the task.",
+    "cancel_task — explicitly request cancellation of one background task.",
+    "Never consume artifacts from a queued, running, or cancelling background task.",
     "Concurrency-safe tools may run in parallel; steps that depend on each other run sequentially.",
   ].join("\n");
 }
@@ -155,6 +162,13 @@ export function buildVolatileSections(
   inputs: ContextBuildInputs,
 ): SystemPromptSection[] {
   return [
+    ...(inputs.hostPrompt?.volatileSections ?? []).map((section) =>
+      volatileSystemPromptSection(
+        `host:${section.id}`,
+        () => section.content,
+        section.reason,
+      )
+    ),
     volatileSystemPromptSection(
       "analysis_task",
       () => formatOptional("Current analysis task", inputs.analysisTask),
@@ -175,6 +189,14 @@ export function buildVolatileSections(
           ? `Tracked artifacts:\n${inputs.artifactSummary}`
           : "Tracked artifacts: none.",
       "tool outputs change as processing tasks settle",
+    ),
+    volatileSystemPromptSection(
+      "background_tasks",
+      () =>
+        inputs.taskSummary
+          ? `Background tasks:\n${inputs.taskSummary}\nDo not consume artifacts from queued, running, or cancelling tasks.`
+          : "Background tasks: none.",
+      "background task state changes independently of the conversation turn",
     ),
     volatileSystemPromptSection(
       "working_directories",
@@ -206,6 +228,12 @@ function buildStaticBlocks(
     tool_semantics: getToolSemantics(),
     tone: getTone(),
     output_efficiency: getOutputEfficiency(),
+    ...Object.fromEntries(
+      (inputs.hostPrompt?.staticSections ?? []).map((section) => [
+        `host:${section.id}`,
+        section.content,
+      ]),
+    ),
   };
 }
 
@@ -241,6 +269,10 @@ function buildStateBlocks(
 ): Record<string, string> {
   const blocks: Record<string, string> = {};
 
+  for (const section of inputs.hostPrompt?.volatileSections ?? []) {
+    blocks[`host:${section.id}`] = section.content;
+  }
+
   if (inputs.analysisTask) {
     blocks["analysis_task"] = formatIndexBlock(
       "Current analysis task",
@@ -254,6 +286,10 @@ function buildStateBlocks(
 
   if (inputs.artifactSummary) {
     blocks["artifact_state"] = `Tracked artifacts:\n${inputs.artifactSummary}`;
+  }
+
+  if (inputs.taskSummary) {
+    blocks["background_tasks"] = `Background tasks:\n${inputs.taskSummary}`;
   }
 
   const directories = [cwd, ...(inputs.additionalWorkingDirectories ?? [])]

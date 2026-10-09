@@ -5,6 +5,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -142,6 +143,28 @@ export class SessionManager {
         } catch {
           return [];
         }
+      })
+      .sort((left, right) => right.modifiedAt - left.modifiedAt);
+  }
+
+  /** List persisted sessions for every project, used by project-agnostic hosts such as Web UI. */
+  static listAll(sessionsRoot: string = getSessionsRoot()): SessionInfo[] {
+    if (!existsSync(sessionsRoot)) return [];
+    return readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .flatMap((directory) => {
+        const path = join(sessionsRoot, directory.name);
+        return readdirSync(path)
+          .filter((name) => name.endsWith(".jsonl"))
+          .flatMap((name) => {
+            const sessionPath = join(path, name);
+            try {
+              const manager = SessionManager.open(sessionPath);
+              return [manager.getInfo(statSync(sessionPath).mtimeMs)];
+            } catch {
+              return [];
+            }
+          });
       })
       .sort((left, right) => right.modifiedAt - left.modifiedAt);
   }
@@ -384,6 +407,19 @@ export class SessionManager {
       this.header.timestamp,
       this.header.id,
     );
+    this.entries = [];
+  }
+
+  /** Remove conversation/history while preserving this session identity and workspace. */
+  clearConversation(): void {
+    this.entries = [];
+    mkdirSync(dirname(this.sessionFile), { recursive: true });
+    writeFileSync(this.sessionFile, `${JSON.stringify(this.header)}\n`, "utf8");
+  }
+
+  /** Permanently remove this session's persisted transcript file. */
+  deletePersistedSession(): void {
+    if (existsSync(this.sessionFile)) unlinkSync(this.sessionFile);
     this.entries = [];
   }
 

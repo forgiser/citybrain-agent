@@ -8,21 +8,39 @@
     "citybrain": "./dist/main.js"
   },
   "scripts": {
+    "predev": "npm run build:web",
     "dev": "tsx src/main.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev:cli": "tsx src/main.ts --mode cli",
+    "dev:web": "concurrently \"vite --config web/vite.config.ts\" \"tsx watch src/main.ts --mode web --no-open\"",
+    "build": "npm run build:server && npm run build:web",
+    "build:server": "tsc -p tsconfig.json",
+    "build:web": "vite build --config web/vite.config.ts",
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "check": "npm run typecheck"
+    "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
+    "check": "npm run typecheck && npm run typecheck:web"
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.85.1",
+    "@fastify/static": "^10.1.5",
     "commander": "14.0.0",
-    "openai": "6.40.0"
+    "fastify": "^5.12.5",
+    "maplibre-gl": "^6.13.0",
+    "openai": "6.40.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "24.3.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
     "tsx": "4.23.13",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vite": "^8.3.4"
   },
   "engines": {
     "node": ">=22.19.0"

@@ -35,25 +35,26 @@ import type {
   AgentHarnessState,
   AgentHarnessStateUpdate,
 } from "./agent-state.js";
-import { ToolExecutionLogger } from "../tools/tool-execution-log.js";
+import { ToolExecutionLogger } from "../tools/core/observability/tool-execution-log.js";
 import type {
   ToolExecutionOutcome,
   ToolProgress,
   ToolRegistry,
-} from "../tools/tool-registry.js";
+} from "../tools/core/execution/tool-registry.js";
 import {
   StreamingToolExecutor,
   type StreamingToolEvent,
   type ToolExecutionResult,
   type ToolExecutionStarted,
-} from "../tools/streaming-tool-executor.js";
+} from "../tools/core/execution/streaming-tool-executor.js";
 import { HarnessController } from "../harness/index.js";
 import type { HumanInteractionBroker } from "../harness/human-interaction.js";
-export type { ToolProgress } from "../tools/tool-registry.js";
+import type { TaskManager } from "../task/index.js";
+export type { ToolProgress } from "../tools/core/contracts/tool-types.js";
 export type {
   ToolExecutionResult,
   ToolExecutionStarted,
-} from "../tools/streaming-tool-executor.js";
+} from "../tools/core/execution/streaming-tool-executor.js";
 
 const MAX_TOOL_TURNS = 12;
 const MAX_IDENTICAL_TOOL_BATCHES = 3;
@@ -89,8 +90,9 @@ export class AgentLoop {
     private readonly contextTraceLogger?: ContextTraceLogger,
     private readonly getContextInputs?: () => ContextBuildInputs,
     private readonly humanInteractionBroker?: HumanInteractionBroker,
+    taskManager?: TaskManager,
   ) {
-    this.streamingToolExecutor = new StreamingToolExecutor(tools);
+    this.streamingToolExecutor = new StreamingToolExecutor(tools, taskManager);
   }
 
   private readonly streamingToolExecutor: StreamingToolExecutor;

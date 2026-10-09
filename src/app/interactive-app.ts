@@ -19,7 +19,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { styleText } from "node:util";
 import { AgentLoop, type AgentEvent } from "../agent/agent-loop.js";
 import type {
@@ -30,12 +30,9 @@ import type {
 import type { AgentStatusUpdate } from "../agent/agent-status.js";
 import type { AgentHarnessStateUpdate } from "../agent/agent-state.js";
 import type { HarnessError } from "../harness/harness-types.js";
-import {
-  HumanInteractionBroker,
-  type HumanInteractionRequest,
-} from "../harness/human-interaction.js";
+import type { HumanInteractionRequest } from "../harness/human-interaction.js";
 import type { ContextUsageSnapshot } from "../context/context-usage.js";
-import { AuthStorage } from "../auth/auth-storage.js";
+import type { AuthStorage } from "../auth/auth-storage.js";
 import { LoginDialog } from "../auth/login-dialog.js";
 import {
   filterProviderOptions,
@@ -60,41 +57,23 @@ import { clearSystemPromptSections } from "../context/index.js";
 import {
   clearConfiguredQgisRuntime,
   configureQgisRuntime,
-  detectQgisRuntime,
   findQgisCandidates,
   type QgisRuntimeInfo,
-} from "../qgis/qgis-runtime.js";
-import { PathInputDialog } from "../qgis/path-input-dialog.js";
+} from "../integrations/qgis/qgis-runtime.js";
+import { PathInputDialog } from "../integrations/qgis/path-input-dialog.js";
 import {
   QGIS_LTR_DOWNLOAD_URL,
   openInBrowser,
-} from "../qgis/qgis-setup.js";
+} from "../integrations/qgis/qgis-setup.js";
 import {
   describeQgisAlgorithm,
   listQgisAlgorithms,
-} from "../qgis/qgis-process-client.js";
-import { createQgisTools } from "../qgis/qgis-tools.js";
+} from "../integrations/qgis/qgis-process-client.js";
 import {
-  executeReadFile,
-  readFileToolDefinition,
-} from "../tools/read-file.js";
-import {
-  executeListFiles,
-  listFilesToolDefinition,
-} from "../tools/list-files.js";
-import {
-  executeWriteFile,
-  writeFileToolDefinition,
-} from "../tools/write-file.js";
-import {
-  editFileToolDefinition,
-  executeEditFile,
-} from "../tools/edit-file.js";
-import { createSubagentTool } from "../tools/subagent-tool.js";
-import { ContextUsageLogger } from "../context/context-usage-log.js";
-import { ContextTraceLogger } from "../context/context-trace-log.js";
-import { ToolExecutionLogger } from "../tools/tool-execution-log.js";
-import { ToolRegistry } from "../tools/tool-registry.js";
+  createAgentRuntime,
+  DEFAULT_RUNTIME_THINKING_LEVEL,
+  type AgentRuntime,
+} from "../runtime/index.js";
 import {
   ensureWorkspace,
   type WorkspaceInfo,
@@ -108,7 +87,7 @@ import { findShellCommand, shellCommands } from "./shell-commands.js";
 import { CliHumanInteractionAdapter } from "./cli-human-interaction.js";
 
 const VERSION = "0.1.0";
-const DEFAULT_THINKING_LEVEL: ThinkingLevel = "high";
+const DEFAULT_THINKING_LEVEL: ThinkingLevel = DEFAULT_RUNTIME_THINKING_LEVEL;
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "high", "max"];
 let THINKING_LEVEL: ThinkingLevel = DEFAULT_THINKING_LEVEL;
 
@@ -139,6 +118,9 @@ const colors = {
   toolErrorBackground: (text: string) => bgRgb(66, 39, 39, text),
   toolErrorText: (text: string) => fgRgb(196, 143, 143, text),
   toolTitle: (text: string) => styleText("bold", fgRgb(224, 221, 216, text)),
+  brand: (text: string) => styleText("bold", fgRgb(112, 190, 202, text)),
+  brandMuted: (text: string) => fgRgb(113, 142, 151, text),
+  section: (text: string) => styleText("bold", fgRgb(164, 184, 189, text)),
   toolPath: (text: string) => underline(fgRgb(139, 193, 187, text)),
   humanBackground: (text: string) => bgRgb(63, 57, 35, text),
   humanText: (text: string) => fgRgb(232, 216, 151, text),
@@ -164,157 +146,24 @@ const editorTheme: EditorTheme = {
   },
 };
 
-export async function startInteractiveApp(): Promise<void> {
-  const authStorage = new AuthStorage();
-  const modelRuntime = new ModelRuntime(authStorage);
-  let session = SessionManager.create(process.cwd());
-  let qgisRuntime = await detectQgisRuntime();
-  let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
-  const humanBroker = new HumanInteractionBroker({
-    defaultTimeoutMs: 5 * 60 * 1_000,
-  });
-  const toolLogger = new ToolExecutionLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "logs", "tool-execution.jsonl"),
-  );
-  humanBroker.subscribe((event) => {
-    void toolLogger.record(ToolExecutionLogger.createHumanInteractionEvent(event));
-  });
-  const contextLogger = new ContextUsageLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "logs", "context-usage.jsonl"),
-  );
-  const contextTraceLogger = new ContextTraceLogger(
-    () => join(session.getWorkspaceDir(), ".internal", "logs", "context-trace.jsonl"),
-  );
-  const toolRegistry = new ToolRegistry({
-    logger: toolLogger,
-    permission: {
-      humanInteractionBroker: humanBroker,
-    },
-    sandbox: () =>
-      SandboxPolicy.fromWorkspace(
-        session.getWorkspaceDir(),
-        session.getProjectDir(),
-      ),
-  });
-  toolRegistry.register(
-    readFileToolDefinition,
-    (args, toolContext) =>
-      executeReadFile(args, session.getProjectDir(), toolContext),
-    {
-      source: "builtin",
-      isReadOnly: () => true,
-      isDestructive: () => false,
-      isConcurrencySafe: () => true,
-      interruptBehavior: "cancel",
-      getPath: getSinglePath,
-      getReadPaths: getSinglePath,
-      getActivityDescription: () => "Reading file",
-      getToolUseSummary: getSinglePath,
-      maxResultSizeChars: 20_000,
-    },
-  );
-  toolRegistry.register(
-    listFilesToolDefinition,
-    (args, toolContext) =>
-      executeListFiles(args, session.getProjectDir(), toolContext?.sandbox),
-    {
-      source: "builtin",
-      isReadOnly: () => true,
-      isDestructive: () => false,
-      isConcurrencySafe: () => true,
-      interruptBehavior: "cancel",
-      getPath: getSinglePath,
-      getReadPaths: getSinglePath,
-      getActivityDescription: () => "Listing files",
-      getToolUseSummary: (args) => getSinglePath(args) ?? ".",
-      maxResultSizeChars: 20_000,
-    },
-  );
-  toolRegistry.register(
-    writeFileToolDefinition,
-    (args, toolContext) => executeWriteFile(args, toolContext),
-    {
-      source: "builtin",
-      isReadOnly: () => false,
-      isDestructive: () => true,
-      isConcurrencySafe: () => false,
-      interruptBehavior: "block",
-      getPath: getSinglePath,
-      getWritePaths: getSinglePath,
-      getActivityDescription: () => "Writing file",
-      getToolUseSummary: getSinglePath,
-      maxResultSizeChars: 20_000,
-      requiresUserInteraction: () => true,
-    },
-  );
-  toolRegistry.register(
-    editFileToolDefinition,
-    (args, toolContext) => executeEditFile(args, toolContext),
-    {
-      source: "builtin",
-      isReadOnly: () => false,
-      isDestructive: () => true,
-      isConcurrencySafe: () => false,
-      interruptBehavior: "block",
-      getPath: getSinglePath,
-      getWritePaths: getSinglePath,
-      getActivityDescription: () => "Editing file",
-      getToolUseSummary: getSinglePath,
-      maxResultSizeChars: 20_000,
-      requiresUserInteraction: () => true,
-    },
-  );
-  for (const tool of createQgisTools(() => qgisRuntime)) {
-    toolRegistry.register(tool.definition, tool.handler, {
-      ...tool.metadata,
-      producesArtifacts: tool.producesArtifacts,
-    });
-  }
-  const delegateTool = createSubagentTool({
-      modelRuntime,
-      authStorage,
-    getCwd: () => session.getProjectDir(),
-    getSandboxPolicy: () =>
-      SandboxPolicy.fromWorkspace(
-        session.getWorkspaceDir(),
-        session.getProjectDir(),
-      ),
-    getQgisRuntime: () => qgisRuntime,
-    toolLogger,
-    contextLogger,
-    humanInteractionBroker: humanBroker,
-    options: { thinkingLevel },
-  });
-  toolRegistry.register(delegateTool.definition, delegateTool.handler, {
-    isConcurrencySafe: delegateTool.isConcurrencySafe,
-    source: "subagent",
-    isReadOnly: () => false,
-    isDestructive: () => false,
-    interruptBehavior: "block",
-    getActivityDescription: () => "Delegating subtask",
-    getToolUseSummary: (args) =>
-      isPlainObject(args) && typeof args.description === "string"
-        ? args.description
-        : "subagent",
-    maxResultSizeChars: 20_000,
-  });
-  const agentLoop = new AgentLoop(
-    modelRuntime,
+export async function startInteractiveApp(
+  providedRuntime?: AgentRuntime,
+): Promise<void> {
+  const runtime =
+    providedRuntime ??
+    (await createAgentRuntime({
+      cwd: process.cwd(),
+      thinkingLevel: DEFAULT_THINKING_LEVEL,
+    }));
+  const {
+    agentLoop,
     authStorage,
-    session,
-    toolRegistry,
-    toolLogger,
-    contextLogger,
-    contextTraceLogger,
-    () => ({
-      qgisRuntimeSummary: qgisRuntime
-        ? `${qgisRuntime.version} (${qgisRuntime.executablePath})`
-        : undefined,
-      artifactSummary: formatArtifactSummary(toolRegistry.artifacts.snapshot()),
-      additionalWorkingDirectories: [session.getWorkspaceDir()],
-    }),
-    humanBroker,
-  );
+    humanInteractionBroker: humanBroker,
+    modelRuntime,
+  } = runtime;
+  let session = runtime.getSession();
+  let qgisRuntime = runtime.getQgisRuntime();
+  let thinkingLevel = runtime.getThinkingLevel();
   const terminal = new ProcessTerminal();
   const tui: TUI = new TuiMainScreen(terminal, true);
   const editor = new Editor(tui, editorTheme, {
@@ -352,12 +201,13 @@ export async function startInteractiveApp(): Promise<void> {
   sandboxStatus.setPath(session.getProjectDir());
   const setSession = (nextSession: SessionManager): void => {
     session = nextSession;
-    agentLoop.setSession(nextSession);
+    runtime.setSession(nextSession);
     sandboxStatus.setPath(nextSession.getProjectDir());
     tui.requestRender();
   };
   const setQgisRuntime = (nextRuntime: QgisRuntimeInfo | undefined): void => {
     qgisRuntime = nextRuntime;
+    runtime.setQgisRuntime(nextRuntime);
   };
 
   tui.addChild(createHeader());
@@ -383,8 +233,8 @@ export async function startInteractiveApp(): Promise<void> {
     const stop = (): void => {
       if (stopped) return;
       stopped = true;
-      humanBroker.cancelAll("application stopped");
       humanInteraction.dispose();
+      void runtime.dispose("application stopped");
       if (ctrlCNoticeTimer) clearTimeout(ctrlCNoticeTimer);
       tui.stop();
       process.stdout.write("\n");
@@ -435,6 +285,7 @@ export async function startInteractiveApp(): Promise<void> {
         setSession,
         setThinkingLevel: (level) => {
           thinkingLevel = level;
+          runtime.setThinkingLevel(level);
           THINKING_LEVEL = level;
           editor.borderColor = getThinkingBorderColor(level);
           editor.invalidate();
@@ -513,6 +364,9 @@ interface SubmitContext {
   tui: TUI;
 }
 
+const INIT_USE_CURRENT = "__current__";
+const INIT_CHOOSE_OTHER = "__choose__";
+
 type TranscriptContext = Pick<SubmitContext, "editor" | "transcript" | "tui">;
 
 async function handleSubmit(value: string, context: SubmitContext): Promise<void> {
@@ -561,11 +415,8 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
       case "/qgis":
         await handleQgisCommand(getCommandArgument(input), context);
         return;
-      case "/init":
-        await handleInitCommand(getCommandArgument(input), context);
-        return;
-      case "/sandbox":
-        await handleSandboxCommand(getCommandArgument(input), context);
+      case "/workspace":
+        await handleWorkspaceCommand(getCommandArgument(input), context);
         return;
       case "/login":
         await handleLoginCommand(getCommandArgument(input), context);
@@ -739,8 +590,8 @@ function createQgisStatusMessage(runtime: QgisRuntimeInfo | undefined): Text {
   if (!runtime) {
     return new Text(
       [
-        colors.yellow("QGIS runtime not found. Spatial analysis tools are disabled."),
-        colors.dim("  Run /qgis to set up QGIS processing."),
+        colors.yellow("QGIS PROCESS   ! unavailable"),
+        colors.dim("  Spatial analysis tools are disabled. Configure it with /qgis."),
       ].join("\n"),
       2,
       0,
@@ -749,9 +600,9 @@ function createQgisStatusMessage(runtime: QgisRuntimeInfo | undefined): Text {
 
   return new Text(
     [
-      colors.green("QGIS processing ready"),
-      `  ${runtime.version}`,
-      colors.dim(`  ${runtime.executablePath}`),
+      colors.lightGreen("QGIS PROCESS   ● ready"),
+      `  ${colors.dim(runtime.version.replace(/\s*\(.*/u, ""))}`,
+      colors.dim("  Use /qgis info for runtime details."),
     ].join("\n"),
     2,
     0,
@@ -766,15 +617,16 @@ function createSessionStateMessage(
   const color = state === "new" ? colors.green : colors.cyan;
   const title = state === "new" ? "new session" : "resumed session";
   const detail = state === "new"
-    ? "blank workspace"
+    ? "ready for a city analysis"
     : `${info.messageCount} messages`;
   return new Text(
     [
-      color("────────────────────────────────────────────────"),
-      `${color(title)}  ${colors.dim(info.id.slice(0, 8))}  ${colors.dim(detail)}${session.isPersisted() ? "" : `  ${colors.dim("(not saved)")}`}`,
-      `${colors.dim("sandbox")}  ${colors.dim(session.getProjectDir())}`,
-      `${colors.dim("citybrain")} ${colors.dim(session.getWorkspaceDir())}`,
-      color("────────────────────────────────────────────────"),
+      colors.brand("  CITYBRAIN  /  CITY DATA WORKSPACE"),
+      colors.brandMuted("  ────────────────────────────────────────────────"),
+      `${colors.section("  WORKSPACE")}  ${colors.toolPath(session.getProjectDir())}`,
+      `${colors.section("  CITYBRAIN")}  ${colors.toolPath(session.getWorkspaceDir())}`,
+      `${color("  " + title)}  ${colors.dim(info.id.slice(0, 8))}  ${colors.dim(detail)}${session.isPersisted() ? "" : `  ${colors.dim("(not saved)")}`}`,
+      colors.brandMuted("  ────────────────────────────────────────────────"),
     ].join("\n"),
     2,
     0,
@@ -841,17 +693,14 @@ function formatHumanRequest(
 }
 
 function createHeader(): Text {
-  const cwd = process.cwd();
-  const line = "-".repeat(Math.min(Math.max(cwd.length + 30, 46), 90));
-
   return new Text(
     [
-      `${colors.cyan("  CITYBRAIN")} ${colors.dim("| urban data intelligence")}`,
-      colors.dim(`  v${VERSION}  |  ${cwd}`),
-      colors.dim(line),
+      colors.brand("  ◆ CITYBRAIN"),
+      colors.brandMuted("  ── urban data intelligence / geospatial analysis"),
+      colors.dim(`  v${VERSION}  ·  city analysis workspace`),
       "",
-      colors.white("  City data analysis and governance workspace"),
-      colors.dim("  Type / for commands"),
+      colors.white("  Explore data  ·  reason spatially  ·  produce evidence"),
+      colors.dim("  Type / for commands  ·  /workspace to switch workspace"),
     ].join("\n"),
     0,
     1,
@@ -1076,9 +925,6 @@ async function handleLogoutCommand(
   );
 }
 
-const INIT_USE_CURRENT = "__current__";
-const INIT_CHOOSE_OTHER = "__choose__";
-
 async function handleInitCommand(
   targetArgument: string | undefined,
   context: SubmitContext,
@@ -1118,6 +964,130 @@ async function handleInitCommand(
       ),
     );
   }
+}
+
+async function handleWorkspaceCommand(
+  argument: string | undefined,
+  context: SubmitContext,
+): Promise<void> {
+  const value = argument?.trim();
+  if (!value || value.toLowerCase() === "info") {
+    const policy = SandboxPolicy.fromWorkspace(
+      context.session.getWorkspaceDir(),
+      context.session.getProjectDir(),
+    );
+    addTranscript(
+      context,
+      new Text(
+        [
+          colors.cyan("workspace"),
+          `  ${context.session.getProjectDir()}`,
+          `  citybrain: ${context.session.getWorkspaceDir()}`,
+          "",
+          policy.describe(),
+        ].join("\n"),
+        2,
+        0,
+      ),
+    );
+    return;
+  }
+
+  const [action, ...pathParts] = value.split(/\s+/u);
+  if (action === "add-read" || action === "remove-read") {
+    await handleWorkspaceReadRoot(action, pathParts.join(" "), context);
+    return;
+  }
+
+  const targetDir = value.replace(/^(?:workspace\s+)?(["'])(.*)\1$/u, "$2").trim();
+  if (!targetDir) {
+    addTranscript(context, new Text(colors.dim("workspace switch cancelled"), 2, 0));
+    return;
+  }
+
+  const resolvedTarget = isAbsolute(targetDir)
+    ? resolve(targetDir)
+    : resolve(context.session.getProjectDir(), targetDir);
+  try {
+    const info = ensureWorkspace(resolvedTarget);
+    clearSystemPromptSections();
+    context.session.newSession(info.projectDir);
+    context.setSession(context.session);
+    context.sandboxStatus.setPath(info.projectDir);
+    addTranscript(
+      context,
+      new Text(
+        [
+          colors.green("workspace switched"),
+          `  workspace: ${info.projectDir}`,
+          `  citybrain: ${info.workspaceDir}`,
+          colors.dim("  agent context reset for the new workspace"),
+        ].join("\n"),
+        2,
+        0,
+      ),
+    );
+    updateModelStatus(context);
+  } catch (error) {
+    addTranscript(
+      context,
+      new Text(
+        `${colors.red("workspace failed")}  ${error instanceof Error ? error.message : String(error)}`,
+        2,
+        0,
+      ),
+    );
+  }
+}
+
+async function handleWorkspaceReadRoot(
+  action: "add-read" | "remove-read",
+  rawPath: string,
+  context: SubmitContext,
+): Promise<void> {
+  const requestedPath = rawPath.replace(/^(?:["'])(.*)\1$/u, "$1").trim();
+  if (!requestedPath) {
+    addTranscript(
+      context,
+      new Text(
+        colors.yellow("usage") + "  /workspace " + action + " <directory>",
+        2,
+        0,
+      ),
+    );
+    return;
+  }
+
+  const resolvedReadRoot = isAbsolute(requestedPath)
+    ? resolve(requestedPath)
+    : resolve(context.session.getProjectDir(), requestedPath);
+  if (!existsSync(resolvedReadRoot) || !statSync(resolvedReadRoot).isDirectory()) {
+    addTranscript(
+      context,
+      new Text(colors.red("workspace failed") + `  Directory not found: ${resolvedReadRoot}`, 2, 0),
+    );
+    return;
+  }
+
+  const policy = SandboxPolicy.fromWorkspace(
+    context.session.getWorkspaceDir(),
+    context.session.getProjectDir(),
+  );
+  const manifest = action === "add-read"
+    ? addWorkspaceReadRoot(policy.workspaceRoot, policy.projectDir, resolvedReadRoot)
+    : removeWorkspaceReadRoot(policy.workspaceRoot, policy.projectDir, resolvedReadRoot);
+  addTranscript(
+    context,
+    new Text(
+      [
+        colors.green(action === "add-read" ? "read root added" : "read root removed"),
+        `  ${resolvedReadRoot}`,
+        colors.dim(`  workspace: ${manifest.projectDir}`),
+      ].join("\n"),
+      2,
+      0,
+    ),
+  );
 }
 
 async function handleSandboxCommand(
@@ -2717,7 +2687,7 @@ class AgentStatusFooter implements Component {
   }
 }
 
-/** Persistent bottom line showing the active file-system sandbox (citybrain/). */
+/** Persistent bottom line showing the active CityBrain workspace. */
 class SandboxStatus implements Component {
   private path = "";
 
@@ -2731,7 +2701,7 @@ class SandboxStatus implements Component {
     if (!this.path) return [];
     const innerWidth = Math.max(1, width - 1);
     return [
-      ` ${truncateToWidth(`${colors.cyan("sandbox")}  ${colors.dim(this.path)}`, innerWidth, "")}`,
+      ` ${truncateToWidth(`${colors.cyan("workspace")}  ${colors.dim(this.path)}`, innerWidth, "")}`,
     ];
   }
 }
@@ -2773,22 +2743,4 @@ class FooterStatus implements Component {
     const gap = " ".repeat(Math.max(1, innerWidth - totalWidth));
     return [` ${this.left}${middle}${gap}${this.right}`];
   }
-}
-
-function formatArtifactSummary(
-  records: Array<{
-    path: string;
-    status: string;
-    producerTaskId: string;
-    error?: string;
-  }>,
-): string | undefined {
-  if (records.length === 0) return undefined;
-  return records
-    .slice(-20)
-    .map((record) => {
-      const error = record.error ? `: ${record.error}` : "";
-      return `- ${record.status} ${record.path} (task ${record.producerTaskId})${error}`;
-    })
-    .join("\n");
 }

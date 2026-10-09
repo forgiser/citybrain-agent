@@ -49,8 +49,13 @@ export interface ContextBuildInputs {
   qgisRuntimeSummary?: string;
   /** Compact summary of tracked tool/QGIS artifacts. */
   artifactSummary?: string;
+  /** Compact summary of queued/running/recent background tasks. */
+  taskSummary?: string;
   /** Absolute paths the agent is rooted in (for workspace awareness). */
   additionalWorkingDirectories?: string[];
   /** Today's date string, injected as `Today's date: <date>`. */
   today?: string;
+  /** Host-specific prompt contributions resolved for this model request. */
+  hostPrompt?: ResolvedHostPrompt;
 }
+import type { ResolvedHostPrompt } from "../host/index.js";

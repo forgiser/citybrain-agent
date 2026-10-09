@@ -1,17 +1,17 @@
-# AGENT.md
+# AGENTS.md
 
-Geo-agent 的 CityBrain 项目说明（可选）。在此补充分析目标、数据来源与项目约定，供代理参考。
+Geo-agent CityBrain project guidance. Add project goals, data sources, naming rules, CRS requirements, and output conventions here.
 
-## 目标
+## Goals
 
-（一句话说明要完成的分析）
+- 
 
-## 数据
+## Data
 
-（数据文件位置与说明）
+- 
 
-## 约定
+## Constraints
 
-- 统一坐标系（CRS）：
-- 输出格式：
-- 命名规范：
+- Coordinate reference system:
+- Output format:
+- Naming convention:
