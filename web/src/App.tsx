@@ -533,7 +533,11 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
   }
 
   async function addMap(item: typeof items[number]) {
-    const artifact = await registerFileArtifact(item);
+    const artifact = await api<Artifact>(`/api/sessions/${session.id}/map/layers`, {
+      method: "POST",
+      body: JSON.stringify({ rootId, path: item.relativePath }),
+    });
+    onArtifact(artifact);
     onAddToMap(artifact);
     return artifact;
   }

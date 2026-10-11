@@ -59,11 +59,11 @@ function createAddMapLayerTool(deps: MapToolDependencies): ToolSpec {
       type: "function",
       function: {
         name: "map_add_layer",
-        description: "Explicitly add a local GeoJSON file to the active Web UI map. Files are never added automatically.",
+        description: "Explicitly add a local vector file to the active Web UI map. Supports GeoJSON, SHP, GPKG, KML, and GML; files are never added automatically.",
         parameters: {
           type: "object",
           properties: {
-            path: { type: "string", description: "Absolute or project-relative path to a .geojson file." },
+            path: { type: "string", description: "Absolute or project-relative path to a GeoJSON, SHP, GPKG, KML, or GML file." },
             fit: { type: "boolean", description: "Whether to zoom to the layer after adding it. Defaults to true." },
           },
           required: ["path"],
@@ -79,15 +79,15 @@ function createAddMapLayerTool(deps: MapToolDependencies): ToolSpec {
         deps.getSessionId(),
         "add_layer",
         { path, fit },
-        { timeoutMs: 20_000, signal: context?.signal },
+        { timeoutMs: 10 * 60_000, signal: context?.signal },
       );
       return JSON.stringify(result, null, 2);
     },
     metadata: {
       ...mapCommandMetadata(
         deps,
-        () => "Adding a GeoJSON layer to the Web map",
-        (input) => `Add ${typeof input.path === "string" ? input.path : "GeoJSON"} to map`,
+        () => "Preparing and adding a vector layer to the Web map",
+        (input) => `Add ${typeof input.path === "string" ? input.path : "vector layer"} to map`,
       ),
       getReadPaths: (input) => readString(asRecord(input).path, "path"),
     },

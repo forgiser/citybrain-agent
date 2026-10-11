@@ -15,6 +15,7 @@ import type {
 import { ensureWorkspace } from "../../workspace/workspace.js";
 import { SandboxPolicy } from "../../workspace/sandbox-policy.js";
 import { WebSettingsService } from "./web-settings.js";
+import { MapLayerService, type PreparedMapLayer } from "./map-layer-service.js";
 import {
   browseDirectories,
   getWorkspaceRoots,
@@ -41,6 +42,7 @@ export async function startWebApp(
   const host = options.host ?? "127.0.0.1";
   const preferredPort = options.port ?? 3170;
   const artifacts = new ArtifactService();
+  const mapLayers = new MapLayerService();
   const runs = new RunManager(runtime, {
     onArtifactPaths: (input) => {
       artifacts.registerPaths(input);
@@ -55,7 +57,7 @@ export async function startWebApp(
   }
 
   const server = Fastify({ logger: false, bodyLimit: 2_000_000 });
-  registerApi(server, runtime, runs, artifacts, settings, sessions);
+  registerApi(server, runtime, runs, artifacts, mapLayers, settings, sessions);
   await registerWebAssets(server);
 
   const port = await listenOnAvailablePort(server, host, preferredPort);
@@ -83,6 +85,7 @@ function registerApi(
   runtime: AgentRuntime,
   runs: RunManager,
   artifacts: ArtifactService,
+  mapLayers: MapLayerService,
   settings: WebSettingsService,
   sessions: Map<string, SessionManager>,
 ): void {
@@ -158,6 +161,7 @@ function registerApi(
     session.deletePersistedSession();
     sessions.delete(sessionId);
     artifacts.removeSession(sessionId);
+    mapLayers.removeSession(sessionId);
     runtime.mapStateStore.removeSession(sessionId);
     runtime.visualizationStateStore.removeSession(sessionId);
     runtime.mapCommandBridge.removeSession(sessionId);
@@ -422,6 +426,65 @@ function registerApi(
     return artifact;
   });
 
+  server.post("/api/sessions/:sessionId/map/layers", async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const body = asRecord(request.body);
+    const session = requireSession(sessionId, sessions, runtime);
+    const requestedPath = readOptionalString(body.absolutePath);
+    const path = requestedPath
+      ? resolveAgentArtifactPath(session, requestedPath)
+      : resolveWorkspacePath(
+          session,
+          readRequiredString(body.rootId, "rootId"),
+          readRequiredString(body.path, "path"),
+        ).path;
+    const layer = await mapLayers.prepare(session, {
+      path,
+      ...(readOptionalString(body.name) ? { name: readOptionalString(body.name) } : {}),
+      ...(readOptionalString(body.layerName) ? { layerName: readOptionalString(body.layerName) } : {}),
+      ...(readOptionalString(body.sourceCrs) ? { sourceCrs: readOptionalString(body.sourceCrs) } : {}),
+    }, runtime.getQgisRuntime());
+    reply.code(201);
+    return toMapArtifact(layer);
+  });
+
+  server.get("/api/sessions/:sessionId/map/layers", async (request) => {
+    const { sessionId } = request.params as { sessionId: string };
+    requireSession(sessionId, sessions, runtime);
+    return mapLayers.list(sessionId).map(toMapArtifact);
+  });
+
+  server.patch("/api/sessions/:sessionId/map/layers/:layerId", async (request) => {
+    const { sessionId, layerId } = request.params as { sessionId: string; layerId: string };
+    requireSession(sessionId, sessions, runtime);
+    return toMapArtifact(mapLayers.update(sessionId, layerId, asRecord(request.body)));
+  });
+
+  server.delete("/api/sessions/:sessionId/map/layers/:layerId", async (request, reply) => {
+    const { sessionId, layerId } = request.params as { sessionId: string; layerId: string };
+    requireSession(sessionId, sessions, runtime);
+    const removed = mapLayers.remove(sessionId, layerId);
+    if (!removed) {
+      reply.code(404);
+      return { error: "Map layer not found." };
+    }
+    return { removed: true };
+  });
+
+  server.get("/api/map/layers/:layerId/data", async (request, reply) => {
+    const { layerId } = request.params as { layerId: string };
+    const data = mapLayers.getData(layerId);
+    if (!data || !existsSync(data.path)) {
+      reply.code(404);
+      return { error: "Map layer data not found." };
+    }
+    const session = requireSession(data.sessionId, sessions, runtime);
+    SandboxPolicy.fromWorkspace(session.getWorkspaceDir(), session.getProjectDir())
+      .assertReadable(data.path);
+    reply.type(data.contentType);
+    return reply.send(createReadStream(data.path));
+  });
+
   server.get("/api/artifacts", async (request) => {
     const query = request.query as { sessionId?: string };
     return artifacts.list(query.sessionId);
@@ -461,6 +524,31 @@ function resolveAgentArtifactPath(session: SessionManager, requestedPath: string
   const policy = SandboxPolicy.fromWorkspace(session.getWorkspaceDir(), session.getProjectDir());
   policy.assertReadable(path);
   return path;
+}
+
+function toMapArtifact(layer: PreparedMapLayer): Record<string, unknown> {
+  return {
+    id: layer.id,
+    sessionId: layer.sessionId,
+    name: layer.name,
+    kind: "vector",
+    status: layer.status,
+    contentType: layer.contentType,
+    size: layer.sizeBytes,
+    contentUrl: layer.dataUrl,
+    map: { format: "geojson", dataUrl: layer.dataUrl, crs: layer.displayCrs },
+    layer: {
+      sourcePath: layer.sourcePath,
+      sourceFormat: layer.sourceFormat,
+      ...(layer.sourceCrs ? { sourceCrs: layer.sourceCrs } : {}),
+      displayCrs: layer.displayCrs,
+      cached: layer.cached,
+      visible: layer.visible,
+      opacity: layer.opacity,
+      order: layer.order,
+      ...(layer.style ? { style: layer.style } : {}),
+    },
+  };
 }
 
 async function registerWebAssets(server: FastifyInstance): Promise<void> {

@@ -5,7 +5,7 @@ import type { SessionManager } from "../../session/session-manager.js";
 import { SandboxPolicy } from "../../workspace/sandbox-policy.js";
 
 const PREVIEW_EXTENSIONS = new Set([".txt", ".md", ".json", ".geojson", ".csv", ".html"]);
-const MAP_EXTENSIONS = new Set([".geojson"]);
+const MAP_EXTENSIONS = new Set([".geojson", ".shp", ".gpkg", ".kml", ".gml"]);
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const MAX_PREVIEW_BYTES = 1_000_000;
 
@@ -113,7 +113,7 @@ function visualizationForExtension(extension: string):
   | "text"
   | "image"
   | undefined {
-  if (extension === ".geojson") return "map";
+  if (MAP_EXTENSIONS.has(extension)) return "map";
   if (extension === ".json") return "json";
   if (extension === ".md") return "markdown";
   if (extension === ".html") return "html";

@@ -275,21 +275,21 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
               type: "fill",
               source: sourceId,
               filter: ["==", ["geometry-type"], "Polygon"],
-              paint: { "fill-color": "#22c55e", "fill-opacity": 0.28, "fill-outline-color": "#86efac" },
+              paint: { "fill-color": "#22c55e", "fill-opacity": (artifact.layer?.opacity ?? 1) * 0.28, "fill-outline-color": "#86efac" },
             });
             map.addLayer({
               id: `line-${artifact.id}`,
               type: "line",
               source: sourceId,
               filter: ["==", ["geometry-type"], "LineString"],
-              paint: { "line-color": "#38bdf8", "line-width": 3 },
+              paint: { "line-color": "#38bdf8", "line-width": 3, "line-opacity": artifact.layer?.opacity ?? 1 },
             });
             map.addLayer({
               id: `point-${artifact.id}`,
               type: "circle",
               source: sourceId,
               filter: ["==", ["geometry-type"], "Point"],
-              paint: { "circle-color": "#f59e0b", "circle-radius": 6, "circle-stroke-color": "#fff", "circle-stroke-width": 1 },
+              paint: { "circle-color": "#f59e0b", "circle-radius": 6, "circle-opacity": artifact.layer?.opacity ?? 1, "circle-stroke-color": "#fff", "circle-stroke-width": 1 },
             });
             if (autoFit) fitGeoJson(map, geojson);
           })
@@ -333,6 +333,34 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       }
       return next;
     });
+    if (sessionId) {
+      void api(`/api/sessions/${sessionId}/map/layers/${artifactId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ visible: hidden }),
+      }).catch(() => undefined);
+    }
+  }
+
+  function setLayerOpacity(artifactId: string, opacity: number) {
+    const map = mapRef.current;
+    if (map?.getLayer(`fill-${artifactId}`)) map.setPaintProperty(`fill-${artifactId}`, "fill-opacity", opacity * 0.28);
+    if (map?.getLayer(`line-${artifactId}`)) map.setPaintProperty(`line-${artifactId}`, "line-opacity", opacity);
+    if (map?.getLayer(`point-${artifactId}`)) map.setPaintProperty(`point-${artifactId}`, "circle-opacity", opacity);
+    if (sessionId) {
+      void api(`/api/sessions/${sessionId}/map/layers/${artifactId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ opacity }),
+      }).catch(() => undefined);
+    }
+  }
+
+  async function removeLayer(artifactId: string) {
+    const map = mapRef.current;
+    if (map) removeMapLayer(map, artifactId);
+    onLayerRemoved(artifactId);
+    if (sessionId) {
+      await api(`/api/sessions/${sessionId}/map/layers/${artifactId}`, { method: "DELETE" });
+    }
   }
 
   async function zoomTo(artifact: Artifact) {
@@ -359,7 +387,7 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       <div className="layer-card">
         <strong>图层</strong>
         {artifacts.filter((item) => item.map?.format === "geojson").length === 0 ? (
-          <p>地图不会自动加载生成文件。请在项目目录中点击“＋图”添加 GeoJSON。</p>
+          <p>地图不会自动加载文件。请在项目目录中点击“＋图”添加 GeoJSON、SHP、GPKG、KML 或 GML。</p>
         ) : artifacts.filter((item) => item.map?.format === "geojson").map((item) => (
           <div className="layer-entry" key={item.id}>
             <div className="layer-row">
@@ -367,7 +395,18 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
               <span className="layer-swatch" />
               <span>{item.name}</span>
               <button title="缩放至图层" onClick={() => void zoomTo(item)}>⌖</button>
+              <button title="移除图层" onClick={() => void removeLayer(item.id)}>×</button>
             </div>
+            <input
+              className="layer-opacity"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              defaultValue={item.layer?.opacity ?? 1}
+              title="图层透明度"
+              onChange={(event) => setLayerOpacity(item.id, Number(event.target.value))}
+            />
             {layerErrors.get(item.id) && <small className="layer-error">{layerErrors.get(item.id)}</small>}
           </div>
         ))}
@@ -450,12 +489,12 @@ async function executeMapCommand(
     });
   } else if (envelope.command === "add_layer") {
     const path = readCommandString(envelope.payload.path, "path");
-    const artifact = await api<Artifact>(`/api/sessions/${sessionId}/artifacts`, {
+    const artifact = await api<Artifact>(`/api/sessions/${sessionId}/map/layers`, {
       method: "POST",
       body: JSON.stringify({ absolutePath: path }),
     });
     if (artifact.status !== "ready" || artifact.map?.format !== "geojson" || !artifact.map.dataUrl) {
-      throw new Error(`Only a ready GeoJSON file can be added to the map: ${path}`);
+      throw new Error(`The vector file could not be prepared as a display-ready GeoJSON layer: ${path}`);
     }
     await addGeoJsonLayer(map, artifact, envelope.payload.fit !== false);
     handlers.onLayerAdded(artifact);
@@ -466,6 +505,7 @@ async function executeMapCommand(
     if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
     removeMapLayer(map, artifact.id);
     handlers.onLayerRemoved(artifact.id);
+    await api(`/api/sessions/${sessionId}/map/layers/${artifact.id}`, { method: "DELETE" });
     reportedArtifacts = artifacts.filter((item) => item.id !== artifact.id);
   } else if (envelope.command === "set_layer_visibility") {
     const layer = readCommandString(envelope.payload.layer, "layer");
@@ -474,6 +514,10 @@ async function executeMapCommand(
     if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
     setMapLayerVisibility(map, artifact.id, visible);
     handlers.setLayerVisibility(artifact.id, visible);
+    await api(`/api/sessions/${sessionId}/map/layers/${artifact.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ visible }),
+    });
     reportedHiddenLayers = new Set(hiddenLayers);
     if (visible) reportedHiddenLayers.delete(artifact.id);
     else reportedHiddenLayers.add(artifact.id);
@@ -509,21 +553,21 @@ async function addGeoJsonLayer(map: MapLibreMap, artifact: Artifact, fit: boolea
       type: "fill",
       source: sourceId,
       filter: ["==", ["geometry-type"], "Polygon"],
-      paint: { "fill-color": "#22c55e", "fill-opacity": 0.28, "fill-outline-color": "#86efac" },
+      paint: { "fill-color": "#22c55e", "fill-opacity": (artifact.layer?.opacity ?? 1) * 0.28, "fill-outline-color": "#86efac" },
     });
     map.addLayer({
       id: `line-${artifact.id}`,
       type: "line",
       source: sourceId,
       filter: ["==", ["geometry-type"], "LineString"],
-      paint: { "line-color": "#38bdf8", "line-width": 3 },
+      paint: { "line-color": "#38bdf8", "line-width": 3, "line-opacity": artifact.layer?.opacity ?? 1 },
     });
     map.addLayer({
       id: `point-${artifact.id}`,
       type: "circle",
       source: sourceId,
       filter: ["==", ["geometry-type"], "Point"],
-      paint: { "circle-color": "#f59e0b", "circle-radius": 6, "circle-stroke-color": "#fff", "circle-stroke-width": 1 },
+      paint: { "circle-color": "#f59e0b", "circle-radius": 6, "circle-opacity": artifact.layer?.opacity ?? 1, "circle-stroke-color": "#fff", "circle-stroke-width": 1 },
     });
   }
   if (fit) fitGeoJson(map, value);

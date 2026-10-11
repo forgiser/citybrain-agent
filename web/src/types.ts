@@ -35,6 +35,17 @@ export interface Artifact {
   contentType?: string;
   size?: number;
   map?: { format: string; dataUrl?: string; crs?: string };
+  layer?: {
+    sourcePath: string;
+    sourceFormat: string;
+    sourceCrs?: string;
+    displayCrs: string;
+    cached: boolean;
+    visible: boolean;
+    opacity: number;
+    order: number;
+    style?: Record<string, unknown>;
+  };
 }
 
 export interface TaskSnapshot {
