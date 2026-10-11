@@ -5,7 +5,7 @@ import type { SessionManager } from "../../session/session-manager.js";
 import { SandboxPolicy } from "../../workspace/sandbox-policy.js";
 
 const PREVIEW_EXTENSIONS = new Set([".txt", ".md", ".json", ".geojson", ".csv", ".html"]);
-const MAP_EXTENSIONS = new Set([".geojson", ".shp", ".gpkg", ".kml", ".gml"]);
+const MAP_EXTENSIONS = new Set([".geojson", ".shp", ".gpkg", ".kml", ".gml", ".tif", ".tiff", ".vrt", ".img", ".asc"]);
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 const MAX_PREVIEW_BYTES = 1_000_000;
 

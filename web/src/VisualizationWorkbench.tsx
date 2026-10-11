@@ -1,6 +1,6 @@
 import { MapPanel } from "./MapPanel";
 import { MarkdownContent } from "./MarkdownContent";
-import type { Artifact } from "./types";
+import type { Artifact, PendingMapLayer } from "./types";
 
 export type VisualizationKind =
   | "map"
@@ -32,6 +32,7 @@ export const MAP_VISUALIZATION: VisualizationTab = {
 export function VisualizationWorkbench({
   sessionId,
   artifacts,
+  pendingLayers,
   autoFit,
   baseMap,
   tabs,
@@ -43,6 +44,7 @@ export function VisualizationWorkbench({
 }: {
   sessionId?: string;
   artifacts: Artifact[];
+  pendingLayers: PendingMapLayer[];
   autoFit: boolean;
   baseMap: "osm" | "blank";
   tabs: VisualizationTab[];
@@ -69,7 +71,7 @@ export function VisualizationWorkbench({
       </div>
       <div className="visualization-stage">
         <div className={`visualization-view map-view ${activeTabId === "map" ? "active" : ""}`}>
-          <MapPanel sessionId={sessionId} artifacts={artifacts} autoFit={autoFit} baseMap={baseMap} onLayerAdded={onLayerAdded} onLayerRemoved={onLayerRemoved} />
+          <MapPanel sessionId={sessionId} artifacts={artifacts} pendingLayers={pendingLayers} autoFit={autoFit} baseMap={baseMap} onLayerAdded={onLayerAdded} onLayerRemoved={onLayerRemoved} />
         </div>
         {tabs.filter((tab) => tab.kind !== "map").map((tab) => (
           <div className={`visualization-view ${tab.id === activeTabId ? "active" : ""}`} key={tab.id}>

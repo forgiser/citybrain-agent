@@ -6,18 +6,24 @@ import {
   Popup,
   ScaleControl,
   setWorkerUrl,
+  type ExpressionSpecification,
   type GeoJSONSource,
 } from "maplibre-gl";
 import mapLibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import { api } from "./api";
 import { getWebClientId } from "./clientId";
-import type { Artifact } from "./types";
+import type { Artifact, PendingMapLayer } from "./types";
 
 setWorkerUrl(mapLibreWorkerUrl);
+
+// map.loaded() becomes false again while sources, tiles, or animations are
+// active. Commands only need the style to have initialized once.
+const initializedMaps = new WeakSet<MapLibreMap>();
 
 interface MapPanelProps {
   sessionId?: string;
   artifacts: Artifact[];
+  pendingLayers: PendingMapLayer[];
   autoFit: boolean;
   baseMap: "osm" | "blank";
   onLayerAdded: (artifact: Artifact) => void;
@@ -33,22 +39,39 @@ interface MapSelection {
 
 interface MapCommandEnvelope {
   id: string;
-  command: "set_view" | "fit_layer" | "add_layer" | "remove_layer" | "set_layer_visibility";
+  command: "set_view" | "fit_layer" | "add_layer" | "remove_layer" | "set_layer_visibility" | "update_layer" | "inspect_layer" | "visualize_layer";
   payload: Record<string, unknown>;
+}
+
+interface LayerVisualization {
+  mode: "simple" | "categorical" | "graduated";
+  field?: string;
+  title: string;
+  color: string;
+  opacity: number;
+  pointRadius: number;
+  lineWidth: number;
+  classification?: "quantile" | "equal_interval";
+  legend: Array<{ label: string; color: string }>;
+  categoryStops?: Array<{ value: string | number | boolean; color: string }>;
+  numericStops?: Array<{ minimum: number; color: string }>;
 }
 
 interface MapCommandHandlers {
   onLayerAdded: (artifact: Artifact) => void;
   onLayerRemoved: (artifactId: string) => void;
   setLayerVisibility: (artifactId: string, visible: boolean) => void;
+  setLayerVisualization: (artifactId: string, visualization: LayerVisualization) => void;
 }
 
-export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded, onLayerRemoved }: MapPanelProps) {
+export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap, onLayerAdded, onLayerRemoved }: MapPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const [hiddenLayers, setHiddenLayers] = useState<Set<string>>(new Set());
   const [layerErrors, setLayerErrors] = useState<Map<string, string>>(new Map());
+  const [layerVisualizations, setLayerVisualizations] = useState<Map<string, LayerVisualization>>(new Map());
   const [mapError, setMapError] = useState<string>();
+  const [commandLoads, setCommandLoads] = useState<PendingMapLayer[]>([]);
   const artifactsRef = useRef(artifacts);
   const hiddenLayersRef = useRef(hiddenLayers);
   const selectionRef = useRef<MapSelection | undefined>(undefined);
@@ -109,7 +132,10 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       );
       reportState();
     });
-    map.on("load", reportState);
+    map.on("style.load", () => {
+      initializedMaps.add(map);
+      reportState();
+    });
     map.on("click", (event) => {
       const features = map.queryRenderedFeatures(event.point).filter((feature) =>
         feature.layer.id.startsWith("fill-") ||
@@ -157,15 +183,25 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
   }, [baseMap, sessionId]);
 
   useEffect(() => {
-    artifactsRef.current = artifacts;
-    hiddenLayersRef.current = hiddenLayers;
+    // Preserve command-added layers while React is committing the parent
+    // artifact/id state in separate updates. A layer that still has a live
+    // MapLibre source is authoritative even if one intermediate render omits it.
     const map = mapRef.current;
+    const nextArtifacts = [...artifacts];
+    const nextIds = new Set(nextArtifacts.map((artifact) => artifact.id));
+    for (const artifact of artifactsRef.current) {
+      if (!nextIds.has(artifact.id) && map?.getSource(`source-${artifact.id}`)) {
+        nextArtifacts.push(artifact);
+      }
+    }
+    artifactsRef.current = nextArtifacts;
+    hiddenLayersRef.current = hiddenLayers;
     if (map && sessionId) {
       void reportMapState(
         map,
         sessionId,
         clientIdRef.current,
-        artifacts,
+        nextArtifacts,
         hiddenLayers,
         selectionRef.current,
       );
@@ -182,8 +218,24 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       const event = rawEvent as MessageEvent<string>;
       void (async () => {
         let command: MapCommandEnvelope | undefined;
+        let pendingId: string | undefined;
         try {
           command = JSON.parse(event.data) as MapCommandEnvelope;
+          if (command.command === "add_layer" || command.command === "visualize_layer") {
+            pendingId = `command:${command.id}`;
+            const source = command.command === "add_layer" ? command.payload.path : command.payload.layer;
+            const path = typeof source === "string" ? source : "地图图层";
+            const name = path.split(/[\\/]/u).at(-1) || "地图图层";
+            setCommandLoads((value) => [{
+              id: pendingId!,
+              name,
+              message: command?.command === "visualize_layer"
+                ? "Agent 正在生成并应用图层可视化…"
+                : /\.(?:tif|tiff|vrt|img|asc)$/iu.test(name)
+                ? "Agent 正在重投影并准备栅格影像…"
+                : "Agent 正在准备地图图层…",
+            }, ...value.filter((item) => item.id !== pendingId)]);
+          }
           const map = mapRef.current;
           if (!map) throw new Error("The Web map is not initialized.");
           const result = await executeMapCommand(
@@ -195,8 +247,20 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
             hiddenLayersRef.current,
             selectionRef.current,
             {
-              onLayerAdded,
-              onLayerRemoved,
+              onLayerAdded: (artifact) => {
+                // Command chaining must not wait for React to commit the next
+                // render. Keep the command-side registry current immediately
+                // so add -> inspect/visualize can use the returned layer id.
+                artifactsRef.current = [
+                  artifact,
+                  ...artifactsRef.current.filter((item) => item.id !== artifact.id),
+                ];
+                onLayerAdded(artifact);
+              },
+              onLayerRemoved: (artifactId) => {
+                artifactsRef.current = artifactsRef.current.filter((item) => item.id !== artifactId);
+                onLayerRemoved(artifactId);
+              },
               setLayerVisibility: (artifactId, visible) => {
                 setHiddenLayers((value) => {
                   const next = new Set(value);
@@ -204,6 +268,9 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
                   hiddenLayersRef.current = next;
                   return next;
                 });
+              },
+              setLayerVisualization: (artifactId, visualization) => {
+                setLayerVisualizations((value) => new Map(value).set(artifactId, visualization));
               },
             },
           );
@@ -222,6 +289,10 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
               error: error instanceof Error ? error.message : String(error),
             }),
           }).catch(() => undefined);
+        } finally {
+          if (pendingId) {
+            setCommandLoads((value) => value.filter((item) => item.id !== pendingId));
+          }
         }
       })();
     };
@@ -240,7 +311,7 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       if (cancelled) return;
       const activeIds = new Set(artifacts.map((artifact) => artifact.id));
       for (const layer of map.getStyle().layers ?? []) {
-        const artifactId = layer.id.match(/^(?:fill|line|point)-(.+)$/u)?.[1];
+        const artifactId = layer.id.match(/^(?:fill|line|point|raster)-(.+)$/u)?.[1];
         if (artifactId && !activeIds.has(artifactId) && map.getLayer(layer.id)) map.removeLayer(layer.id);
       }
       for (const sourceId of Object.keys(map.getStyle().sources ?? {})) {
@@ -248,9 +319,38 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
         if (artifactId && !activeIds.has(artifactId) && map.getSource(sourceId)) map.removeSource(sourceId);
       }
       for (const artifact of artifacts) {
-        if (artifact.status !== "ready" || artifact.map?.format !== "geojson" || !artifact.map.dataUrl) continue;
+        if (artifact.status !== "ready" || !isDisplayMapArtifact(artifact) || !artifact.map?.dataUrl) continue;
         const sourceId = `source-${artifact.id}`;
         if (map.getSource(sourceId)) continue;
+        if (artifact.map.format === "raster-image") {
+          void addRasterImageLayer(map, artifact, autoFit)
+            .then(() => {
+              if (cancelled || mapRef.current !== map) return;
+              setLayerErrors((value) => {
+                const next = new Map(value);
+                next.delete(artifact.id);
+                return next;
+              });
+              if (sessionId) {
+                void reportMapState(
+                  map,
+                  sessionId,
+                  clientIdRef.current,
+                  artifactsRef.current,
+                  hiddenLayersRef.current,
+                  selectionRef.current,
+                );
+              }
+            })
+            .catch((error: unknown) => {
+              if (cancelled) return;
+              setLayerErrors((value) => new Map(value).set(
+                artifact.id,
+                error instanceof Error ? error.message : String(error),
+              ));
+            });
+          continue;
+        }
         void fetch(artifact.map.dataUrl)
           .then(async (response) => {
             if (!response.ok) throw new Error(`读取图层失败（HTTP ${response.status}）`);
@@ -267,6 +367,16 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
             });
             if (map.getSource(sourceId)) {
               (map.getSource(sourceId) as GeoJSONSource).setData(geojson);
+              if (sessionId) {
+                void reportMapState(
+                  map,
+                  sessionId,
+                  clientIdRef.current,
+                  artifactsRef.current,
+                  hiddenLayersRef.current,
+                  selectionRef.current,
+                );
+              }
               return;
             }
             map.addSource(sourceId, { type: "geojson", data: geojson });
@@ -292,6 +402,16 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
               paint: { "circle-color": "#f59e0b", "circle-radius": 6, "circle-opacity": artifact.layer?.opacity ?? 1, "circle-stroke-color": "#fff", "circle-stroke-width": 1 },
             });
             if (autoFit) fitGeoJson(map, geojson);
+            if (sessionId) {
+              void reportMapState(
+                map,
+                sessionId,
+                clientIdRef.current,
+                artifactsRef.current,
+                hiddenLayersRef.current,
+                selectionRef.current,
+              );
+            }
           })
           .catch((error: unknown) => {
             if (cancelled) return;
@@ -302,18 +422,18 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
           });
       }
     };
-    if (map.loaded()) load();
-    else map.once("load", load);
+    if (initializedMaps.has(map) || map.isStyleLoaded()) load();
+    else map.once("style.load", load);
     return () => {
       cancelled = true;
-      map.off("load", load);
+      map.off("style.load", load);
     };
   }, [artifacts, autoFit, sessionId]);
 
   function toggleLayer(artifactId: string) {
     const map = mapRef.current;
     const hidden = hiddenLayers.has(artifactId);
-    for (const prefix of ["fill", "line", "point"]) {
+    for (const prefix of ["fill", "line", "point", "raster"]) {
       const id = `${prefix}-${artifactId}`;
       if (map?.getLayer(id)) map.setLayoutProperty(id, "visibility", hidden ? "visible" : "none");
     }
@@ -346,6 +466,7 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
     if (map?.getLayer(`fill-${artifactId}`)) map.setPaintProperty(`fill-${artifactId}`, "fill-opacity", opacity * 0.28);
     if (map?.getLayer(`line-${artifactId}`)) map.setPaintProperty(`line-${artifactId}`, "line-opacity", opacity);
     if (map?.getLayer(`point-${artifactId}`)) map.setPaintProperty(`point-${artifactId}`, "circle-opacity", opacity);
+    if (map?.getLayer(`raster-${artifactId}`)) map.setPaintProperty(`raster-${artifactId}`, "raster-opacity", opacity);
     if (sessionId) {
       void api(`/api/sessions/${sessionId}/map/layers/${artifactId}`, {
         method: "PATCH",
@@ -366,13 +487,23 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
   async function zoomTo(artifact: Artifact) {
     const map = mapRef.current;
     if (!map || !artifact.map?.dataUrl) return;
+    if (artifact.map.format === "raster-image") {
+      fitRasterCoordinates(map, requireRasterCoordinates(artifact));
+      return;
+    }
     const geojson = await fetch(artifact.map.dataUrl).then((response) => response.json()) as GeoJSON.GeoJSON;
     fitGeoJson(map, geojson);
   }
 
+  const loadingLayers = [...pendingLayers, ...commandLoads];
+
   return (
     <main className="map-panel">
       <div ref={containerRef} className="map-canvas" />
+      {loadingLayers.length > 0 && <div className="map-loading-banner">
+        <i />
+        <div><strong>正在加载地图数据</strong><span>{loadingLayers[0]?.message}</span></div>
+      </div>}
       {mapError && (
         <div className="map-error">
           <strong>地图暂时无法初始化</strong>
@@ -386,13 +517,17 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
       </div>
       <div className="layer-card">
         <strong>图层</strong>
-        {artifacts.filter((item) => item.map?.format === "geojson").length === 0 ? (
+        {loadingLayers.map((item) => <div className="layer-loading" key={item.id}>
+          <i />
+          <div><strong>{item.name}</strong><small>{item.message}</small></div>
+        </div>)}
+        {artifacts.filter(isDisplayMapArtifact).length === 0 && loadingLayers.length === 0 ? (
           <p>地图不会自动加载文件。请在项目目录中点击“＋图”添加 GeoJSON、SHP、GPKG、KML 或 GML。</p>
-        ) : artifacts.filter((item) => item.map?.format === "geojson").map((item) => (
+        ) : artifacts.filter(isDisplayMapArtifact).map((item) => (
           <div className="layer-entry" key={item.id}>
             <div className="layer-row">
               <input type="checkbox" checked={!hiddenLayers.has(item.id)} onChange={() => toggleLayer(item.id)} />
-              <span className="layer-swatch" />
+              <span className="layer-swatch" style={{ background: layerVisualizations.get(item.id)?.legend[0]?.color }} />
               <span>{item.name}</span>
               <button title="缩放至图层" onClick={() => void zoomTo(item)}>⌖</button>
               <button title="移除图层" onClick={() => void removeLayer(item.id)}>×</button>
@@ -407,6 +542,12 @@ export function MapPanel({ sessionId, artifacts, autoFit, baseMap, onLayerAdded,
               title="图层透明度"
               onChange={(event) => setLayerOpacity(item.id, Number(event.target.value))}
             />
+            {layerVisualizations.get(item.id) && <div className="layer-legend">
+              <strong>{layerVisualizations.get(item.id)!.title}</strong>
+              {layerVisualizations.get(item.id)!.legend.map((entry) => <span key={`${entry.label}:${entry.color}`}>
+                <i style={{ background: entry.color }} />{entry.label}
+              </span>)}
+            </div>}
             {layerErrors.get(item.id) && <small className="layer-error">{layerErrors.get(item.id)}</small>}
           </div>
         ))}
@@ -435,12 +576,15 @@ async function reportMapState(
       pitch: map.getPitch(),
       bounds: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
       layers: artifacts
-        .filter((artifact) => artifact.map)
+        // Only publish layers that MapLibre has actually loaded. React/backend
+        // records may exist while a source is still loading or after it failed.
+        .filter((artifact) => artifact.map && map.getSource(`source-${artifact.id}`))
         .map((artifact) => ({
           id: artifact.id,
           name: artifact.name,
           visible: !hiddenLayers.has(artifact.id),
           format: artifact.map?.format,
+          ...(artifact.layer?.style ? { visualization: artifact.layer.style } : {}),
         })),
       ...(selection ? { selection } : {}),
     }),
@@ -457,10 +601,12 @@ async function executeMapCommand(
   selection: MapSelection | undefined,
   handlers: MapCommandHandlers,
 ): Promise<Record<string, unknown>> {
-  await waitForMapLoad(map);
+  // Inspection reads prepared GeoJSON and does not depend on the renderer.
+  if (envelope.command !== "inspect_layer") await waitForMapInitialization(map);
   const durationMs = readCommandNumber(envelope.payload.durationMs, 0);
   let reportedArtifacts = artifacts;
   let reportedHiddenLayers = hiddenLayers;
+  let commandResult: Record<string, unknown> = {};
   if (envelope.command === "set_view") {
     const center = readCommandCoordinate(envelope.payload.center);
     await runMapMovement(map, durationMs, () => {
@@ -476,27 +622,37 @@ async function executeMapCommand(
     const layer = String(envelope.payload.layer ?? "").trim();
     const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
     if (!artifact?.map?.dataUrl) throw new Error(`Map layer not found or not ready: ${layer}`);
-    const geojson = await fetch(artifact.map.dataUrl).then(async (response) => {
-      if (!response.ok) throw new Error(`Unable to load layer data: ${response.status}`);
-      return response.json() as Promise<GeoJSON.GeoJSON>;
-    });
+    const rasterCoordinates = artifact.map.format === "raster-image"
+      ? requireRasterCoordinates(artifact)
+      : undefined;
+    const geojson = rasterCoordinates ? undefined : await loadArtifactGeoJson(artifact);
     await runMapMovement(map, durationMs, () => {
-      fitGeoJson(map, geojson, {
+      const fitOptions = {
         padding: readCommandNumber(envelope.payload.padding, 70),
         maxZoom: readCommandNumber(envelope.payload.maxZoom, 14),
         duration: durationMs,
-      });
+      };
+      if (rasterCoordinates) {
+        fitRasterCoordinates(map, rasterCoordinates, fitOptions);
+      } else {
+        fitGeoJson(map, geojson!, fitOptions);
+      }
     });
   } else if (envelope.command === "add_layer") {
     const path = readCommandString(envelope.payload.path, "path");
     const artifact = await api<Artifact>(`/api/sessions/${sessionId}/map/layers`, {
       method: "POST",
-      body: JSON.stringify({ absolutePath: path }),
+      body: JSON.stringify({
+        absolutePath: path,
+        ...(typeof envelope.payload.layerName === "string" && envelope.payload.layerName.trim()
+          ? { layerName: envelope.payload.layerName.trim() }
+          : {}),
+      }),
     });
-    if (artifact.status !== "ready" || artifact.map?.format !== "geojson" || !artifact.map.dataUrl) {
-      throw new Error(`The vector file could not be prepared as a display-ready GeoJSON layer: ${path}`);
+    if (artifact.status !== "ready" || !isDisplayMapArtifact(artifact) || !artifact.map?.dataUrl) {
+      throw new Error(`The file could not be prepared as a display-ready map layer: ${path}`);
     }
-    await addGeoJsonLayer(map, artifact, envelope.payload.fit !== false);
+    await addPreparedMapLayer(map, artifact, envelope.payload.fit !== false);
     handlers.onLayerAdded(artifact);
     reportedArtifacts = [artifact, ...artifacts.filter((item) => item.id !== artifact.id)];
   } else if (envelope.command === "remove_layer") {
@@ -521,12 +677,84 @@ async function executeMapCommand(
     reportedHiddenLayers = new Set(hiddenLayers);
     if (visible) reportedHiddenLayers.delete(artifact.id);
     else reportedHiddenLayers.add(artifact.id);
+  } else if (envelope.command === "update_layer") {
+    const layer = readCommandString(envelope.payload.layer, "layer");
+    const changes = readCommandRecord(envelope.payload.changes, "changes");
+    const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
+    if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
+    const patch: Record<string, unknown> = {};
+    if (changes.visible !== undefined) {
+      const visible = readCommandBoolean(changes.visible, "changes.visible");
+      setMapLayerVisibility(map, artifact.id, visible);
+      handlers.setLayerVisibility(artifact.id, visible);
+      reportedHiddenLayers = new Set(hiddenLayers);
+      if (visible) reportedHiddenLayers.delete(artifact.id); else reportedHiddenLayers.add(artifact.id);
+      patch.visible = visible;
+    }
+    if (changes.opacity !== undefined) {
+      const opacity = readCommandNumberInRange(changes.opacity, 1, 0, 1, "changes.opacity");
+      setMapLayerOpacity(map, artifact.id, opacity);
+      if (artifact.layer) artifact.layer.opacity = opacity;
+      patch.opacity = opacity;
+    }
+    if (Object.keys(patch).length === 0) throw new Error("changes must include visible or opacity.");
+    await api(`/api/sessions/${sessionId}/map/layers/${artifact.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+    commandResult = { updated: patch };
+  } else if (envelope.command === "inspect_layer") {
+    const layer = readCommandString(envelope.payload.layer, "layer");
+    const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
+    if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
+    if (artifact.map?.format === "raster-image") {
+      return {
+        id: artifact.id,
+        name: artifact.name,
+        kind: "raster",
+        format: artifact.layer?.sourceFormat,
+        crs: artifact.map.crs,
+        coordinates: artifact.map.coordinates,
+        message: "Raster attribute and band inspection is not yet available in the Web map inspector.",
+      };
+    }
+    const geojson = await loadArtifactGeoJson(artifact);
+    return inspectGeoJsonLayer(artifact, geojson, readCommandInteger(envelope.payload.maxUniqueValues, 12, 2, 50));
+  } else if (envelope.command === "visualize_layer") {
+    const layer = readCommandString(envelope.payload.layer, "layer");
+    const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
+    if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
+    if (artifact.map?.format === "raster-image") {
+      const mode = readCommandEnum(envelope.payload.mode, "mode", ["grayscale", "rgb", "color_relief", "hillshade"] as const);
+      const updated = await api<Artifact>(`/api/sessions/${sessionId}/map/layers/${artifact.id}/visualize`, {
+        method: "POST",
+        body: JSON.stringify({ ...envelope.payload, mode }),
+      });
+      removeMapLayer(map, artifact.id);
+      await addRasterImageLayer(map, updated, false);
+      if (hiddenLayers.has(artifact.id)) setMapLayerVisibility(map, artifact.id, false);
+      handlers.onLayerAdded(updated);
+      reportedArtifacts = [updated, ...artifacts.filter((item) => item.id !== artifact.id)];
+      commandResult = { visualization: updated.layer?.style, raster: true };
+    } else {
+      const geojson = await loadArtifactGeoJson(artifact);
+      const visualization = buildLayerVisualization(geojson, envelope.payload);
+      applyLayerVisualization(map, artifact.id, visualization);
+      if (artifact.layer) artifact.layer.style = visualization as unknown as Record<string, unknown>;
+      handlers.setLayerVisualization(artifact.id, visualization);
+      await api(`/api/sessions/${sessionId}/map/layers/${artifact.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ style: visualization, opacity: visualization.opacity }),
+      });
+      commandResult = { visualization };
+    }
   } else {
     throw new Error(`Unsupported map command: ${String(envelope.command)}`);
   }
 
   await reportMapState(map, sessionId, clientId, reportedArtifacts, reportedHiddenLayers, selection);
   return {
+    ...commandResult,
     ...currentMapView(map),
     layers: reportedArtifacts.map((artifact) => ({
       id: artifact.id,
@@ -535,6 +763,295 @@ async function executeMapCommand(
       format: artifact.map?.format,
     })),
   };
+}
+
+async function loadArtifactGeoJson(artifact: Artifact): Promise<GeoJSON.GeoJSON> {
+  if (!artifact.map?.dataUrl) throw new Error(`Layer data is unavailable: ${artifact.name}`);
+  const response = await fetch(artifact.map.dataUrl);
+  if (!response.ok) throw new Error(`Unable to load layer data: ${response.status}`);
+  const value = await response.json() as unknown;
+  if (!isGeoJson(value)) throw new Error(`Layer is not valid GeoJSON: ${artifact.name}`);
+  return value;
+}
+
+function inspectGeoJsonLayer(
+  artifact: Artifact,
+  geojson: GeoJSON.GeoJSON,
+  maxUniqueValues: number,
+): Record<string, unknown> {
+  const features = collectFeatures(geojson);
+  const geometryCounts = new Map<string, number>();
+  const fields = new Map<string, {
+    count: number;
+    nullCount: number;
+    types: Set<string>;
+    unique: Map<string, string | number | boolean>;
+    uniqueOverflow: boolean;
+    minimum?: number;
+    maximum?: number;
+  }>();
+  for (const feature of features) {
+    const geometryType = feature.geometry?.type ?? "null";
+    geometryCounts.set(geometryType, (geometryCounts.get(geometryType) ?? 0) + 1);
+    for (const [name, rawValue] of Object.entries(feature.properties ?? {})) {
+      const state = fields.get(name) ?? {
+        count: 0,
+        nullCount: 0,
+        types: new Set<string>(),
+        unique: new Map<string, string | number | boolean>(),
+        uniqueOverflow: false,
+      };
+      state.count += 1;
+      if (rawValue === null || rawValue === undefined) {
+        state.nullCount += 1;
+        state.types.add("null");
+      } else {
+        const type = typeof rawValue;
+        state.types.add(type);
+        if (type === "number" && Number.isFinite(rawValue)) {
+          const number = rawValue as number;
+          state.minimum = state.minimum === undefined ? number : Math.min(state.minimum, number);
+          state.maximum = state.maximum === undefined ? number : Math.max(state.maximum, number);
+        }
+        if (type === "string" || type === "number" || type === "boolean") {
+          const primitive = rawValue as string | number | boolean;
+          const key = `${type}:${String(primitive)}`;
+          if (state.unique.size < maxUniqueValues) state.unique.set(key, primitive);
+          else if (!state.unique.has(key)) state.uniqueOverflow = true;
+        }
+      }
+      fields.set(name, state);
+    }
+  }
+  return {
+    layer: { id: artifact.id, name: artifact.name },
+    featureCount: features.length,
+    geometryTypes: Object.fromEntries(geometryCounts),
+    fields: [...fields.entries()].slice(0, 100).map(([name, state]) => ({
+      name,
+      types: [...state.types],
+      populatedCount: state.count - state.nullCount,
+      nullCount: features.length - (state.count - state.nullCount),
+      ...(state.minimum !== undefined ? { minimum: state.minimum, maximum: state.maximum } : {}),
+      uniqueValues: [...state.unique.values()].map((value) => typeof value === "string" ? value.slice(0, 160) : value),
+      uniqueValuesTruncated: state.uniqueOverflow,
+    })),
+    fieldsTruncated: fields.size > 100,
+  };
+}
+
+function buildLayerVisualization(
+  geojson: GeoJSON.GeoJSON,
+  payload: Record<string, unknown>,
+): LayerVisualization {
+  const mode = readCommandEnum(payload.mode, "mode", ["simple", "categorical", "graduated"] as const);
+  const field = mode === "simple" ? undefined : readCommandString(payload.field, "field");
+  const opacity = readCommandNumberInRange(payload.opacity, 0.78, 0, 1, "opacity");
+  const pointRadius = readCommandNumberInRange(payload.pointRadius, 6, 1, 30, "pointRadius");
+  const lineWidth = readCommandNumberInRange(payload.lineWidth, 3, 0.5, 20, "lineWidth");
+  const classes = readCommandInteger(payload.classes, 5, 2, 9);
+  const color = readCommandColor(payload.color, "#2563eb");
+  const palette = readCommandPalette(payload.palette, mode === "graduated" ? GRADUATED_PALETTE : CATEGORICAL_PALETTE);
+  const title = typeof payload.title === "string" && payload.title.trim()
+    ? payload.title.trim().slice(0, 100)
+    : field ?? "图层样式";
+  if (mode === "simple") {
+    return { mode, title, color, opacity, pointRadius, lineWidth, legend: [{ label: artifactValueLabel(title), color }] };
+  }
+
+  const features = collectFeatures(geojson);
+  const values = features
+    .map((feature) => feature.properties?.[field!])
+    .filter((value): value is string | number | boolean => ["string", "number", "boolean"].includes(typeof value));
+  if (values.length === 0) throw new Error(`Field has no visualizable values: ${field}`);
+
+  if (mode === "categorical") {
+    const counts = new Map<string, { value: string | number | boolean; count: number }>();
+    for (const value of values) {
+      const key = `${typeof value}:${String(value)}`;
+      const existing = counts.get(key);
+      if (existing) existing.count += 1;
+      else counts.set(key, { value, count: 1 });
+    }
+    const selected = [...counts.values()].sort((left, right) => right.count - left.count).slice(0, classes);
+    const legend = selected.map((entry, index) => ({
+      label: `${artifactValueLabel(entry.value)} (${entry.count})`,
+      color: palette[index % palette.length]!,
+    }));
+    if (counts.size > selected.length) legend.push({ label: `其他 (${counts.size - selected.length} 类)`, color });
+    return {
+      mode,
+      field,
+      title,
+      color,
+      opacity,
+      pointRadius,
+      lineWidth,
+      legend,
+      categoryStops: selected.map((entry, index) => ({ value: String(entry.value), color: palette[index % palette.length]! })),
+    };
+  }
+
+  const numeric = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value)).sort((a, b) => a - b);
+  if (numeric.length === 0) throw new Error(`Graduated visualization requires a numeric field: ${field}`);
+  const classification = readCommandEnum(payload.classification, "classification", ["quantile", "equal_interval"] as const, "quantile");
+  const actualClasses = Math.min(classes, Math.max(1, new Set(numeric).size));
+  const breaks = createNumericBreaks(numeric, actualClasses, classification);
+  const legend = breaks.map((range, index) => ({
+    label: `${formatLegendNumber(range.minimum)} – ${formatLegendNumber(range.maximum)}`,
+    color: paletteColor(palette, index, breaks.length),
+  }));
+  return {
+    mode,
+    field,
+    title,
+    color,
+    opacity,
+    pointRadius,
+    lineWidth,
+    classification,
+    legend,
+    numericStops: breaks.map((range, index) => ({ minimum: range.minimum, color: paletteColor(palette, index, breaks.length) })),
+  };
+}
+
+function applyLayerVisualization(map: MapLibreMap, artifactId: string, visualization: LayerVisualization): void {
+  const colorExpression = createColorExpression(visualization);
+  const fillId = `fill-${artifactId}`;
+  const lineId = `line-${artifactId}`;
+  const pointId = `point-${artifactId}`;
+  if (map.getLayer(fillId)) {
+    map.setPaintProperty(fillId, "fill-color", colorExpression);
+    map.setPaintProperty(fillId, "fill-opacity", visualization.opacity * 0.55);
+    map.setPaintProperty(fillId, "fill-outline-color", colorExpression);
+  }
+  if (map.getLayer(lineId)) {
+    map.setPaintProperty(lineId, "line-color", colorExpression);
+    map.setPaintProperty(lineId, "line-opacity", visualization.opacity);
+    map.setPaintProperty(lineId, "line-width", visualization.lineWidth);
+  }
+  if (map.getLayer(pointId)) {
+    map.setPaintProperty(pointId, "circle-color", colorExpression);
+    map.setPaintProperty(pointId, "circle-opacity", visualization.opacity);
+    map.setPaintProperty(pointId, "circle-radius", visualization.pointRadius);
+  }
+}
+
+function createColorExpression(visualization: LayerVisualization): string | ExpressionSpecification {
+  if (visualization.mode === "simple" || !visualization.field) return visualization.color;
+  if (visualization.mode === "categorical") {
+    const expression: unknown[] = ["match", ["to-string", ["get", visualization.field]]];
+    for (const entry of visualization.categoryStops ?? []) expression.push(entry.value, entry.color);
+    expression.push(visualization.color);
+    return expression as ExpressionSpecification;
+  }
+  const stops = visualization.numericStops ?? [];
+  const expression: unknown[] = ["step", ["to-number", ["get", visualization.field]], stops[0]?.color ?? visualization.color];
+  for (const entry of stops.slice(1)) expression.push(entry.minimum, entry.color);
+  return expression as ExpressionSpecification;
+}
+
+function collectFeatures(geojson: GeoJSON.GeoJSON): GeoJSON.Feature[] {
+  if (geojson.type === "FeatureCollection") return geojson.features;
+  if (geojson.type === "Feature") return [geojson];
+  return [{ type: "Feature", properties: {}, geometry: geojson as GeoJSON.Geometry }];
+}
+
+function createNumericBreaks(
+  sorted: number[],
+  classes: number,
+  classification: "quantile" | "equal_interval",
+): Array<{ minimum: number; maximum: number }> {
+  const minimum = sorted[0]!;
+  const maximum = sorted.at(-1)!;
+  if (classes <= 1 || minimum === maximum) return [{ minimum, maximum }];
+  const thresholds: number[] = [minimum];
+  for (let index = 1; index < classes; index += 1) {
+    const value = classification === "equal_interval"
+      ? minimum + ((maximum - minimum) * index) / classes
+      : sorted[Math.min(sorted.length - 1, Math.floor((sorted.length * index) / classes))]!;
+    if (value > thresholds.at(-1)!) thresholds.push(value);
+  }
+  return thresholds.map((start, index) => ({
+    minimum: start,
+    maximum: index + 1 < thresholds.length ? thresholds[index + 1]! : maximum,
+  }));
+}
+
+const CATEGORICAL_PALETTE = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#0891b2", "#db2777", "#65a30d", "#9333ea"];
+const GRADUATED_PALETTE = ["#eff6ff", "#bfdbfe", "#60a5fa", "#2563eb", "#1e3a8a", "#172554"];
+
+function readCommandPalette(value: unknown, fallback: string[]): string[] {
+  if (value === undefined) return fallback;
+  if (!Array.isArray(value) || value.length < 2 || value.length > 12) throw new Error("palette must contain 2 to 12 colors.");
+  return value.map((color) => readCommandColor(color));
+}
+
+function readCommandColor(value: unknown, fallback?: string): string {
+  if (value === undefined && fallback) return fallback;
+  if (typeof value !== "string" || !/^#[0-9a-f]{6}$/iu.test(value)) throw new Error("Colors must use six-digit CSS hex syntax.");
+  return value;
+}
+
+function readCommandEnum<const T extends readonly string[]>(value: unknown, name: string, values: T, fallback?: T[number]): T[number] {
+  if (value === undefined && fallback !== undefined) return fallback;
+  if (typeof value !== "string" || !values.includes(value)) throw new Error(`${name} must be one of: ${values.join(", ")}.`);
+  return value as T[number];
+}
+
+function readCommandInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const number = readCommandNumberInRange(value, fallback, minimum, maximum, "integer value");
+  if (!Number.isInteger(number)) throw new Error("Expected an integer value.");
+  return number;
+}
+
+function readCommandNumberInRange(value: unknown, fallback: number, minimum: number, maximum: number, name: string): number {
+  const number = value === undefined ? fallback : value;
+  if (typeof number !== "number" || !Number.isFinite(number) || number < minimum || number > maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}.`);
+  }
+  return number;
+}
+
+function artifactValueLabel(value: unknown): string {
+  return String(value).slice(0, 80);
+}
+
+function formatLegendNumber(value: number): string {
+  return Number(value.toPrecision(6)).toString();
+}
+
+function paletteColor(palette: string[], index: number, total: number): string {
+  if (total <= 1) return palette.at(-1)!;
+  return palette[Math.round((index * (palette.length - 1)) / (total - 1))]!;
+}
+
+async function addPreparedMapLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
+  if (artifact.map?.format === "raster-image") {
+    await addRasterImageLayer(map, artifact, fit);
+    return;
+  }
+  await addGeoJsonLayer(map, artifact, fit);
+}
+
+async function addRasterImageLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
+  if (!artifact.map?.dataUrl) throw new Error(`Layer data is unavailable: ${artifact.name}`);
+  const coordinates = requireRasterCoordinates(artifact);
+  const sourceId = `source-${artifact.id}`;
+  if (!map.getSource(sourceId)) {
+    map.addSource(sourceId, {
+      type: "image",
+      url: artifact.map.dataUrl,
+      coordinates,
+    });
+    map.addLayer({
+      id: `raster-${artifact.id}`,
+      type: "raster",
+      source: sourceId,
+      paint: { "raster-opacity": artifact.layer?.opacity ?? 1 },
+    });
+  }
+  if (fit) fitRasterCoordinates(map, coordinates);
 }
 
 async function addGeoJsonLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
@@ -574,7 +1091,7 @@ async function addGeoJsonLayer(map: MapLibreMap, artifact: Artifact, fit: boolea
 }
 
 function removeMapLayer(map: MapLibreMap, artifactId: string): void {
-  for (const prefix of ["fill", "line", "point"]) {
+  for (const prefix of ["fill", "line", "point", "raster"]) {
     const id = `${prefix}-${artifactId}`;
     if (map.getLayer(id)) map.removeLayer(id);
   }
@@ -583,24 +1100,67 @@ function removeMapLayer(map: MapLibreMap, artifactId: string): void {
 }
 
 function setMapLayerVisibility(map: MapLibreMap, artifactId: string, visible: boolean): void {
-  for (const prefix of ["fill", "line", "point"]) {
+  for (const prefix of ["fill", "line", "point", "raster"]) {
     const id = `${prefix}-${artifactId}`;
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
   }
 }
 
-function waitForMapLoad(map: MapLibreMap): Promise<void> {
-  if (map.loaded()) return Promise.resolve();
+function setMapLayerOpacity(map: MapLibreMap, artifactId: string, opacity: number): void {
+  if (map.getLayer(`fill-${artifactId}`)) map.setPaintProperty(`fill-${artifactId}`, "fill-opacity", opacity * 0.55);
+  if (map.getLayer(`line-${artifactId}`)) map.setPaintProperty(`line-${artifactId}`, "line-opacity", opacity);
+  if (map.getLayer(`point-${artifactId}`)) map.setPaintProperty(`point-${artifactId}`, "circle-opacity", opacity);
+  if (map.getLayer(`raster-${artifactId}`)) map.setPaintProperty(`raster-${artifactId}`, "raster-opacity", opacity);
+}
+
+function isDisplayMapArtifact(artifact: Artifact): boolean {
+  return artifact.map?.format === "geojson" || artifact.map?.format === "raster-image";
+}
+
+function requireRasterCoordinates(
+  artifact: Artifact,
+): [[number, number], [number, number], [number, number], [number, number]] {
+  const coordinates = artifact.map?.coordinates;
+  if (!coordinates || coordinates.length !== 4 || coordinates.some((coordinate) =>
+    coordinate.length !== 2 || coordinate.some((value) => !Number.isFinite(value))
+  )) {
+    throw new Error(`Raster display coordinates are unavailable: ${artifact.name}`);
+  }
+  return coordinates;
+}
+
+function fitRasterCoordinates(
+  map: MapLibreMap,
+  coordinates: [[number, number], [number, number], [number, number], [number, number]],
+  options: { padding?: number; maxZoom?: number; duration?: number } = {},
+): void {
+  const bounds = coordinates.reduce(
+    (current, coordinate) => current.extend(coordinate),
+    new LngLatBounds(coordinates[0], coordinates[0]),
+  );
+  map.fitBounds(bounds, {
+    padding: options.padding ?? 70,
+    maxZoom: options.maxZoom ?? 14,
+    duration: options.duration ?? 800,
+  });
+}
+
+function waitForMapInitialization(map: MapLibreMap): Promise<void> {
+  if (initializedMaps.has(map) || map.isStyleLoaded()) {
+    initializedMaps.add(map);
+    return Promise.resolve();
+  }
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => {
-      map.off("load", onLoad);
-      reject(new Error("The Web map did not finish loading in time."));
+      map.off("style.load", onStyleLoad);
+      reject(new Error("The Web map style did not initialize in time."));
     }, 10_000);
-    const onLoad = (): void => {
+    const onStyleLoad = (): void => {
       window.clearTimeout(timeout);
+      initializedMaps.add(map);
       resolve();
     };
-    map.once("load", onLoad);
+    map.once("style.load", onStyleLoad);
   });
 }
 
@@ -668,6 +1228,11 @@ function readCommandString(value: unknown, name: string): string {
 function readCommandBoolean(value: unknown, name: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${name} must be a boolean.`);
   return value;
+}
+
+function readCommandRecord(value: unknown, name: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${name} must be an object.`);
+  return value as Record<string, unknown>;
 }
 
 function fitGeoJson(

@@ -24,6 +24,7 @@ import {
 } from "../task/index.js";
 import {
   createFileTools,
+  createHumanInteractionTools,
   createMapTools,
   createQgisTools,
   createSubagentTool,
@@ -128,6 +129,7 @@ export async function createAgentRuntime(
     toolRegistry.registerSpec(tool);
   }
   toolRegistry.registerMany(createTaskManagementTools(taskManager));
+  toolRegistry.registerMany(createHumanInteractionTools({ humanInteractionBroker }));
   toolRegistry.registerMany(createMapTools({
     getSessionId: () => currentSession.getSessionId(),
     mapStateStore,

@@ -13,6 +13,7 @@ import type {
   Artifact,
   InteractionRequest,
   Message,
+  PendingMapLayer,
   RuntimeEnvelope,
   SessionDetails,
   SessionSummary,
@@ -27,7 +28,8 @@ export function App() {
   const [current, setCurrent] = useState<SessionDetails>();
   const [messages, setMessages] = useState<Message[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [mapArtifactIds, setMapArtifactIds] = useState<Set<string>>(new Set());
+  const [mapLayers, setMapLayers] = useState<Artifact[]>([]);
+  const [pendingMapLayers, setPendingMapLayers] = useState<PendingMapLayer[]>([]);
   const [tasks, setTasks] = useState<TaskSnapshot[]>([]);
   const [interaction, setInteraction] = useState<InteractionRequest>();
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("sessions");
@@ -49,7 +51,8 @@ export function App() {
   const resetVisualizations = useCallback(() => {
     setVisualizations([{ ...MAP_VISUALIZATION }]);
     setActiveVisualizationId("map");
-    setMapArtifactIds(new Set());
+    setMapLayers([]);
+    setPendingMapLayers([]);
   }, []);
 
   const registerArtifact = useCallback((artifact: Artifact) => {
@@ -58,19 +61,27 @@ export function App() {
 
   const addArtifactToMap = useCallback((artifact: Artifact) => {
     registerArtifact(artifact);
-    setMapArtifactIds((value) => new Set(value).add(artifact.id));
+    setMapLayers((value) => [artifact, ...value.filter((item) => item.id !== artifact.id)]);
   }, [registerArtifact]);
 
   const removeArtifactFromMap = useCallback((artifactId: string) => {
-    setMapArtifactIds((value) => {
-      const next = new Set(value);
-      next.delete(artifactId);
-      return next;
-    });
+    setMapLayers((value) => value.filter((item) => item.id !== artifactId));
+  }, []);
+
+  const startMapLayerLoad = useCallback((pending: PendingMapLayer) => {
+    setPendingMapLayers((value) => [pending, ...value.filter((item) => item.id !== pending.id)]);
+  }, []);
+
+  const finishMapLayerLoad = useCallback((id: string) => {
+    setPendingMapLayers((value) => value.filter((item) => item.id !== id));
   }, []);
 
   const refreshArtifacts = useCallback(async (sessionId: string) => {
     setArtifacts(await api<Artifact[]>(`/api/artifacts?sessionId=${encodeURIComponent(sessionId)}`));
+  }, []);
+
+  const refreshMapLayers = useCallback(async (sessionId: string) => {
+    setMapLayers(await api<Artifact[]>(`/api/sessions/${sessionId}/map/layers`));
   }, []);
 
   const loadSession = useCallback(async (sessionId: string, activate = false) => {
@@ -81,8 +92,8 @@ export function App() {
       message.role !== "assistant" || Boolean(message.content || message.thinking),
     ));
     resetVisualizations();
-    await refreshArtifacts(sessionId);
-  }, [refreshArtifacts, resetVisualizations]);
+    await Promise.all([refreshArtifacts(sessionId), refreshMapLayers(sessionId)]);
+  }, [refreshArtifacts, refreshMapLayers, resetVisualizations]);
 
   const reportVisualizationState = useCallback(async (sessionId: string) => {
     await api(`/api/sessions/${sessionId}/visualization-state`, {
@@ -217,7 +228,12 @@ export function App() {
         setMessages(result.currentSession?.messages ?? []);
         setArtifacts([]);
         resetVisualizations();
-        if (result.currentSession) await refreshArtifacts(result.currentSession.id);
+        if (result.currentSession) {
+          await Promise.all([
+            refreshArtifacts(result.currentSession.id),
+            refreshMapLayers(result.currentSession.id),
+          ]);
+        }
       }
       setSessions(await api<SessionSummary[]>("/api/sessions"));
     } catch (cause) {
@@ -260,6 +276,22 @@ export function App() {
   }
 
   function handleRuntimeEvent(envelope: RuntimeEnvelope) {
+    if (envelope.type === "task.notification") {
+      const task = envelope.data.task as TaskSnapshot | undefined;
+      setMessages((value) => [
+        ...value,
+        {
+          role: "tool",
+          content: task
+            ? `后台任务 ${task.name} 已${task.status === "completed" ? "完成" : "结束"}（${task.id}）`
+            : "后台任务状态已更新",
+          toolStatus: task?.status === "completed" ? "completed" : "failed",
+          toolSummary: task?.description ?? task?.name ?? "后台任务通知",
+        },
+        { role: "assistant", content: "", thinking: "" },
+      ]);
+      return;
+    }
     if (envelope.type === "message.text_delta") {
       const delta = String(envelope.data.delta ?? "");
       setMessages((value) => appendAssistant(value, "content", delta));
@@ -310,8 +342,7 @@ export function App() {
 
   async function answerInteraction(optionId: string) {
     if (!interaction) return;
-    const option = interaction.options.find((item) => item.id === optionId);
-    const action = optionId.includes("reject") || optionId.includes("deny") ? "reject" : "select";
+    const action = interactionActionForOption(optionId);
     await api(`/api/interactions/${interaction.requestId}/respond`, {
       method: "POST",
       body: JSON.stringify({ action, optionId }),
@@ -369,6 +400,9 @@ export function App() {
                 onAddToMap={addArtifactToMap}
                 onOpenVisualization={openVisualization}
                 onShowMap={() => setActiveVisualizationId("map")}
+                onMapLoadStart={startMapLayerLoad}
+                onMapLoadEnd={finishMapLayerLoad}
+                onError={setError}
               />
             ) : null}
           </div>
@@ -377,7 +411,8 @@ export function App() {
 
         <VisualizationWorkbench
           sessionId={current?.id}
-          artifacts={artifacts.filter((artifact) => mapArtifactIds.has(artifact.id))}
+          artifacts={mapLayers}
+          pendingLayers={pendingMapLayers}
           autoFit={settings?.autoFitNewLayers ?? true}
           baseMap={settings?.baseMap ?? "osm"}
           tabs={visualizations}
@@ -447,12 +482,15 @@ function SessionList({ sessions, currentId, onSelect, onCreate, onClear, onDelet
   </div>;
 }
 
-function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization, onShowMap }: {
+function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization, onShowMap, onMapLoadStart, onMapLoadEnd, onError }: {
   session: SessionDetails;
   onArtifact: (artifact: Artifact) => void;
   onAddToMap: (artifact: Artifact) => void;
   onOpenVisualization: (tab: VisualizationTab) => void;
   onShowMap: () => void;
+  onMapLoadStart: (pending: PendingMapLayer) => void;
+  onMapLoadEnd: (id: string) => void;
+  onError: (message: string) => void;
 }) {
   type WorkspaceItem = {
     name: string;
@@ -467,6 +505,7 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
   const [rootId, setRootId] = useState("workspace");
   const [path, setPath] = useState("");
   const [items, setItems] = useState<WorkspaceItem[]>([]);
+  const [loadingMapPaths, setLoadingMapPaths] = useState<Set<string>>(new Set());
 
   const load = useCallback(async (nextRoot = rootId, nextPath = path) => {
     const result = await api<{ items: typeof items }>(`/api/sessions/${session.id}/files?rootId=${encodeURIComponent(nextRoot)}&path=${encodeURIComponent(nextPath)}`);
@@ -497,8 +536,8 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
       setPath(item.relativePath);
       await load(rootId, item.relativePath);
     } else if (item.visualization === "map") {
-      await addMap(item);
       onShowMap();
+      await addMap(item);
     } else if (item.visualization === "image") {
       const artifact = await registerFileArtifact(item);
       onOpenVisualization({
@@ -533,13 +572,35 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
   }
 
   async function addMap(item: typeof items[number]) {
-    const artifact = await api<Artifact>(`/api/sessions/${session.id}/map/layers`, {
-      method: "POST",
-      body: JSON.stringify({ rootId, path: item.relativePath }),
+    const loadingId = `manual:${session.id}:${rootId}:${item.relativePath}`;
+    if (loadingMapPaths.has(item.relativePath)) return undefined;
+    setLoadingMapPaths((value) => new Set(value).add(item.relativePath));
+    onMapLoadStart({
+      id: loadingId,
+      name: item.name,
+      message: /\.(?:tif|tiff|vrt|img|asc)$/iu.test(item.name)
+        ? "正在重投影并准备栅格影像…"
+        : "正在准备地图图层…",
     });
-    onArtifact(artifact);
-    onAddToMap(artifact);
-    return artifact;
+    try {
+      const artifact = await api<Artifact>(`/api/sessions/${session.id}/map/layers`, {
+        method: "POST",
+        body: JSON.stringify({ rootId, path: item.relativePath }),
+      });
+      onArtifact(artifact);
+      onAddToMap(artifact);
+      return artifact;
+    } catch (cause) {
+      onError(messageOf(cause));
+      return undefined;
+    } finally {
+      setLoadingMapPaths((value) => {
+        const next = new Set(value);
+        next.delete(item.relativePath);
+        return next;
+      });
+      onMapLoadEnd(loadingId);
+    }
   }
 
   function sourcePath(relativePath: string) {
@@ -555,7 +616,12 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
     <div className="path-row"><button disabled={!path} onClick={() => { setPath(parent); void load(rootId, parent); }}>←</button><span>/{path}</span><button onClick={() => void load()}>↻</button></div>
     {items.map((item) => <div className="file-row" key={item.relativePath}>
       <button onClick={() => void open(item)}><span>{item.type === "directory" ? "▸" : fileIcon(item.name)}</span><span>{item.name}</span></button>
-      {item.mappable && <button className="map-add" title="添加到地图" onClick={() => void addMap(item).then(onShowMap)}>＋图</button>}
+      {item.mappable && <button
+        className={`map-add ${loadingMapPaths.has(item.relativePath) ? "loading" : ""}`}
+        title={loadingMapPaths.has(item.relativePath) ? "正在准备图层" : "添加到地图"}
+        disabled={loadingMapPaths.has(item.relativePath)}
+        onClick={() => { onShowMap(); void addMap(item); }}
+      >{loadingMapPaths.has(item.relativePath) ? <><i />处理中</> : "＋图"}</button>}
     </div>)}
   </div>;
 }
@@ -628,7 +694,7 @@ function HumanInteractionCard({ request, onAnswer }: {
     }
   }
   return <section className={`hitl-card risk-${request.risk ?? "medium"}`} aria-label="需要用户确认">
-    <div className="hitl-heading"><span>HITL</span><strong>{request.title}</strong></div>
+    <div className="hitl-heading"><span>{interactionKindLabel(request.kind)}</span><strong>{request.title}</strong></div>
     <p>{request.message}</p>
     <div className="hitl-options">
       {request.options.map((option) => <button
@@ -637,11 +703,32 @@ function HumanInteractionCard({ request, onAnswer }: {
         key={option.id}
         onClick={() => void answer(option.id)}
       >
-        <strong>{submitting === option.id ? "提交中…" : option.label}</strong>
+        <strong>{submitting === option.id ? "提交中…" : option.label}{option.recommended ? " · 推荐" : ""}</strong>
         {option.description && <small>{option.description}</small>}
       </button>)}
     </div>
   </section>;
+}
+
+function interactionKindLabel(kind: InteractionRequest["kind"]): string {
+  return {
+    clarification: "需求澄清",
+    choice: "方案选择",
+    confirmation: "操作确认",
+    destructive_confirmation: "风险确认",
+    recovery_choice: "恢复选择",
+    permission: "权限确认",
+    sandbox_access: "目录授权",
+    provider_fallback: "服务切换",
+  }[kind ?? "confirmation"];
+}
+
+function interactionActionForOption(optionId: string): "approve" | "reject" | "select" | "retry" | "abort" {
+  if (optionId === "approve") return "approve";
+  if (optionId === "retry") return "retry";
+  if (optionId === "abort") return "abort";
+  if (optionId.includes("reject") || optionId.includes("deny")) return "reject";
+  return "select";
 }
 
 function ToolMessage({ message }: { message: Message }) {

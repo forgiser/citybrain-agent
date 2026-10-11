@@ -29,6 +29,7 @@ export type RuntimeEventType =
   | "message.thinking_delta"
   | "agent.event"
   | `task.${string}`
+  | "task.notification"
   | `interaction.${string}`
   | "artifact.ready";
 

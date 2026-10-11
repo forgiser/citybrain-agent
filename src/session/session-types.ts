@@ -29,6 +29,8 @@ export interface SessionMessage {
   provider?: string;
   model?: string;
   usage?: ModelUsage;
+  /** System-generated conversation input that should not render as a user message. */
+  visibility?: "visible" | "system";
 }
 
 export interface SessionMessageEntry extends SessionEntryBase {

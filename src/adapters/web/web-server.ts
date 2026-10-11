@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { ArtifactService } from "../../artifacts/index.js";
 import { openInBrowser } from "../../integrations/qgis/qgis-setup.js";
 import { SessionManager } from "../../session/session-manager.js";
+import type { SessionMessageEntry } from "../../session/session-types.js";
 import type { AgentRuntime } from "../../runtime/agent-runtime.js";
 import { RunManager } from "../../runtime/run-manager.js";
 import type { MapStateUpdate } from "../../runtime/map-state-store.js";
@@ -122,6 +123,7 @@ function registerApi(
     const session = SessionManager.create(projectDir);
     sessions.set(session.getSessionId(), session);
     runtime.setSession(session);
+    runs.notifySessionActivated();
     reply.code(201);
     return toSessionDetails(session);
   });
@@ -141,6 +143,7 @@ function registerApi(
     const { sessionId } = request.params as { sessionId: string };
     const session = requireSession(sessionId, sessions, runtime);
     runtime.setSession(session);
+    runs.notifySessionActivated();
     return toSessionDetails(session);
   });
 
@@ -169,6 +172,7 @@ function registerApi(
     if (deletingCurrent) {
       const replacement = SessionManager.create(projectDir);
       runtime.setSession(replacement);
+      runs.notifySessionActivated();
     }
     return {
       deleted: true,
@@ -181,7 +185,10 @@ function registerApi(
     const body = asRecord(request.body);
     const input = readRequiredString(body.input, "input");
     const session = requireSession(sessionId, sessions, runtime);
-    if (runtime.getSession().getSessionId() !== sessionId) runtime.setSession(session);
+    if (runtime.getSession().getSessionId() !== sessionId) {
+      runtime.setSession(session);
+      runs.notifySessionActivated();
+    }
     const run = runs.start(input);
     reply.code(202);
     return { ...run, eventsUrl: `/api/runs/${run.id}/events` };
@@ -460,6 +467,32 @@ function registerApi(
     return toMapArtifact(mapLayers.update(sessionId, layerId, asRecord(request.body)));
   });
 
+  server.post("/api/sessions/:sessionId/map/layers/:layerId/visualize", async (request) => {
+    const { sessionId, layerId } = request.params as { sessionId: string; layerId: string };
+    requireSession(sessionId, sessions, runtime);
+    const body = asRecord(request.body);
+    const layer = await mapLayers.visualizeRaster(sessionId, layerId, {
+      mode: readRasterVisualizationMode(body.mode),
+      ...(typeof body.band === "number" ? { band: body.band } : {}),
+      ...(isRecord(body.bands) ? { bands: {
+        red: readRequiredNumber(body.bands.red, "bands.red"),
+        green: readRequiredNumber(body.bands.green, "bands.green"),
+        blue: readRequiredNumber(body.bands.blue, "bands.blue"),
+      } } : {}),
+      ...(Array.isArray(body.palette) ? { palette: body.palette.map((value) => readRequiredString(value, "palette color")) } : {}),
+      ...(typeof body.minimum === "number" ? { minimum: body.minimum } : {}),
+      ...(typeof body.maximum === "number" ? { maximum: body.maximum } : {}),
+      ...(typeof body.zFactor === "number" ? { zFactor: body.zFactor } : {}),
+      ...(typeof body.scale === "number" ? { scale: body.scale } : {}),
+      ...(typeof body.azimuth === "number" ? { azimuth: body.azimuth } : {}),
+      ...(typeof body.altitude === "number" ? { altitude: body.altitude } : {}),
+      ...(typeof body.multidirectional === "boolean" ? { multidirectional: body.multidirectional } : {}),
+      ...(typeof body.opacity === "number" ? { opacity: body.opacity } : {}),
+      ...(readOptionalString(body.title) ? { title: readOptionalString(body.title) } : {}),
+    }, runtime.getQgisRuntime());
+    return toMapArtifact(layer);
+  });
+
   server.delete("/api/sessions/:sessionId/map/layers/:layerId", async (request, reply) => {
     const { sessionId, layerId } = request.params as { sessionId: string; layerId: string };
     requireSession(sessionId, sessions, runtime);
@@ -531,12 +564,17 @@ function toMapArtifact(layer: PreparedMapLayer): Record<string, unknown> {
     id: layer.id,
     sessionId: layer.sessionId,
     name: layer.name,
-    kind: "vector",
+    kind: layer.kind,
     status: layer.status,
     contentType: layer.contentType,
     size: layer.sizeBytes,
     contentUrl: layer.dataUrl,
-    map: { format: "geojson", dataUrl: layer.dataUrl, crs: layer.displayCrs },
+    map: {
+      format: layer.kind === "raster" ? "raster-image" : "geojson",
+      dataUrl: layer.dataUrl,
+      crs: layer.displayCrs,
+      ...(layer.coordinates ? { coordinates: layer.coordinates } : {}),
+    },
     layer: {
       sourcePath: layer.sourcePath,
       sourceFormat: layer.sourceFormat,
@@ -549,6 +587,16 @@ function toMapArtifact(layer: PreparedMapLayer): Record<string, unknown> {
       ...(layer.style ? { style: layer.style } : {}),
     },
   };
+}
+
+function readRasterVisualizationMode(value: unknown): "grayscale" | "rgb" | "color_relief" | "hillshade" {
+  if (value === "grayscale" || value === "rgb" || value === "color_relief" || value === "hillshade") return value;
+  throw new Error("Raster visualization mode must be grayscale, rgb, color_relief, or hillshade.");
+}
+
+function readRequiredNumber(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${name} must be a finite number.`);
+  return value;
 }
 
 async function registerWebAssets(server: FastifyInstance): Promise<void> {
@@ -616,7 +664,9 @@ function toSessionDetails(session: SessionManager): Record<string, unknown> {
   return {
     ...toSessionSummary(session),
     messages: session.getEntries()
-      .filter((entry) => entry.type === "message")
+      .filter((entry): entry is SessionMessageEntry =>
+        entry.type === "message" && entry.message.visibility !== "system"
+      )
       .map((entry) => ({ id: entry.id, timestamp: entry.timestamp, ...entry.message })),
   };
 }
@@ -635,6 +685,10 @@ function asRecord(value: unknown): Record<string, unknown> {
     throw new Error("Request body must be an object.");
   }
   return value as Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readRequiredString(value: unknown, name: string): string {

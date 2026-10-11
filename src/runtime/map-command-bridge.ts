@@ -5,7 +5,10 @@ export type MapCommandName =
   | "fit_layer"
   | "add_layer"
   | "remove_layer"
-  | "set_layer_visibility";
+  | "set_layer_visibility"
+  | "update_layer"
+  | "inspect_layer"
+  | "visualize_layer";
 
 export interface MapCommandEnvelope {
   id: string;
@@ -41,6 +44,8 @@ interface PendingCommand {
 export interface MapCommandOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Route the command to the browser client that produced the map state. */
+  clientId?: string;
 }
 
 /** Routes Agent map tools to the most recently connected map client. */
@@ -72,6 +77,10 @@ export class MapCommandBridge {
     return (this.clients.get(sessionId)?.size ?? 0) > 0;
   }
 
+  hasClient(sessionId: string, clientId: string): boolean {
+    return this.clients.get(sessionId)?.has(clientId) ?? false;
+  }
+
   removeSession(sessionId: string, reason = "Session removed."): void {
     this.clients.delete(sessionId);
     for (const [id, pending] of this.pending) {
@@ -88,8 +97,14 @@ export class MapCommandBridge {
     options: MapCommandOptions = {},
   ): Promise<unknown> {
     this.assertActive();
-    const client = this.getActiveClient(sessionId);
-    if (!client) throw new Error("No active Web map client is connected for this session.");
+    const client = options.clientId
+      ? this.clients.get(sessionId)?.get(options.clientId)
+      : this.getActiveClient(sessionId);
+    if (!client) {
+      throw new Error(options.clientId
+        ? `The Web map client that reported the current state is no longer connected: ${options.clientId}`
+        : "No active Web map client is connected for this session.");
+    }
     if (options.signal?.aborted) throw abortError();
 
     const id = `map-command-${randomUUID()}`;

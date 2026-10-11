@@ -8,6 +8,7 @@ import { createDescribeQgisAlgorithmTool } from "./describe-qgis-algorithm/index
 import { createRunQgisAlgorithmTool } from "./run-qgis-algorithm/index.js";
 export { createTaskManagementTools } from "./task-management/index.js";
 export { createMapTools } from "./map/index.js";
+export { createHumanInteractionTools } from "./human-interaction/index.js";
 
 export * from "./core/index.js";
 export * from "./delegate/index.js";
@@ -20,6 +21,7 @@ export * from "./describe-qgis-algorithm/index.js";
 export * from "./run-qgis-algorithm/index.js";
 export * from "./task-management/index.js";
 export * from "./map/index.js";
+export * from "./human-interaction/index.js";
 
 export interface FileToolFactoryDependencies {
   getCwd: () => string;

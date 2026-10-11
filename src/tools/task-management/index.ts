@@ -1,7 +1,6 @@
 import type { ToolSpec } from "../core/contracts/tool-spec.js";
 import {
   TaskManager,
-  TaskWaitTimeoutError,
   isTaskTerminal,
   type TaskSnapshot,
 } from "../../task/index.js";
@@ -9,7 +8,6 @@ import {
 export function createTaskManagementTools(taskManager: TaskManager): ToolSpec[] {
   return [
     createGetTaskStatusTool(taskManager),
-    createWaitTaskTool(taskManager),
     createCancelTaskTool(taskManager),
     createListTasksTool(taskManager),
   ];
@@ -22,60 +20,13 @@ function createGetTaskStatusTool(taskManager: TaskManager): ToolSpec {
       function: {
         name: "get_task_status",
         description:
-          "Get the current state of a background task. A running task has no usable final result yet.",
+          "Get the current state of a background task only when the user explicitly asks for status. " +
+          "Do not use this to poll: terminal results are delivered automatically.",
         parameters: taskIdSchema(),
       },
     },
     handler: async (args) => formatTask(requireTask(taskManager, getTaskId(args))),
     metadata: readOnlyMetadata("Checking background task status"),
-  };
-}
-
-function createWaitTaskTool(taskManager: TaskManager): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "wait_task",
-        description:
-          "Wait briefly for a background task. If it is still running when the wait expires, " +
-          "the task continues in the background and its current state is returned.",
-        parameters: {
-          type: "object",
-          properties: {
-            taskId: { type: "string", description: "Background task id." },
-            timeoutSeconds: {
-              type: "number",
-              description: "How long to wait for this check (1-60 seconds, default 30).",
-            },
-          },
-          required: ["taskId"],
-          additionalProperties: false,
-        },
-      },
-    },
-    handler: async (args, context) => {
-      const taskId = getTaskId(args);
-      requireTask(taskManager, taskId);
-      const timeoutMs = getWaitTimeoutMs(args);
-      try {
-        const task = await taskManager.wait(taskId, {
-          timeoutMs,
-          signal: context?.signal,
-        });
-        return formatTask(task);
-      } catch (error) {
-        if (error instanceof TaskWaitTimeoutError) {
-          return formatTask(requireTask(taskManager, taskId));
-        }
-        throw error;
-      }
-    },
-    metadata: {
-      ...readOnlyMetadata("Waiting for background task"),
-      interruptBehavior: "cancel",
-      isConcurrencySafe: () => false,
-    },
   };
 }
 
@@ -128,7 +79,9 @@ function createListTasksTool(taskManager: TaskManager): ToolSpec {
       type: "function",
       function: {
         name: "list_tasks",
-        description: "List recent background tasks and their current states.",
+        description:
+          "List recent background tasks when the user explicitly asks about tasks. " +
+          "Do not use this for completion polling.",
         parameters: {
           type: "object",
           properties: {
@@ -187,12 +140,6 @@ function getTaskIdSafe(args: unknown): string | undefined {
   return isRecord(args) && typeof args.taskId === "string" && args.taskId.trim()
     ? args.taskId.trim()
     : undefined;
-}
-
-function getWaitTimeoutMs(args: unknown): number {
-  if (!isRecord(args) || typeof args.timeoutSeconds !== "number") return 30_000;
-  if (!Number.isFinite(args.timeoutSeconds)) return 30_000;
-  return Math.min(60, Math.max(1, Math.floor(args.timeoutSeconds))) * 1_000;
 }
 
 function requireTask(taskManager: TaskManager, taskId: string): TaskSnapshot {

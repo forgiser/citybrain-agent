@@ -8,174 +8,14 @@ export interface MapToolDependencies {
   mapCommandBridge: MapCommandBridge;
 }
 
+/** Model-facing Web map tools. Internal browser commands remain deliberately fine-grained. */
 export function createMapTools(deps: MapToolDependencies): ToolSpec[] {
   return [
     createGetMapStateTool(deps),
-    createListMapLayersTool(deps),
-    createAddMapLayerTool(deps),
-    createRemoveMapLayerTool(deps),
-    createSetMapLayerVisibilityTool(deps),
-    createSetMapViewTool(deps),
-    createFitMapLayerTool(deps),
+    createInspectMapLayerTool(deps),
+    createManageMapLayerTool(deps),
+    createControlMapViewTool(deps),
   ];
-}
-
-function createListMapLayersTool(deps: MapToolDependencies): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "map_list_layers",
-        description: "List layers currently loaded in the active Web UI map, including visibility and format.",
-        parameters: { type: "object", properties: {}, additionalProperties: false },
-      },
-    },
-    handler: async () => {
-      const sessionId = deps.getSessionId();
-      const state = deps.mapStateStore.get(sessionId);
-      if (!state || !deps.mapStateStore.isActive(sessionId)) {
-        throw new Error("No active Web map state is available for this session.");
-      }
-      return JSON.stringify({ layers: state.layers ?? [] }, null, 2);
-    },
-    metadata: {
-      source: "map",
-      supportedModes: ["web"],
-      requiredCapabilities: ["map_layers"],
-      isAvailable: () => deps.mapStateStore.isActive(deps.getSessionId()),
-      isReadOnly: () => true,
-      isConcurrencySafe: () => true,
-      interruptBehavior: "cancel",
-      getActivityDescription: () => "Listing Web map layers",
-      getToolUseSummary: () => "List loaded map layers",
-      maxResultSizeChars: 20_000,
-    },
-  };
-}
-
-function createAddMapLayerTool(deps: MapToolDependencies): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "map_add_layer",
-        description: "Explicitly add a local vector file to the active Web UI map. Supports GeoJSON, SHP, GPKG, KML, and GML; files are never added automatically.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string", description: "Absolute or project-relative path to a GeoJSON, SHP, GPKG, KML, or GML file." },
-            fit: { type: "boolean", description: "Whether to zoom to the layer after adding it. Defaults to true." },
-          },
-          required: ["path"],
-          additionalProperties: false,
-        },
-      },
-    },
-    handler: async (input, context) => {
-      const args = asRecord(input);
-      const path = readString(args.path, "path");
-      const fit = args.fit === undefined ? true : readBoolean(args.fit, "fit");
-      const result = await deps.mapCommandBridge.execute(
-        deps.getSessionId(),
-        "add_layer",
-        { path, fit },
-        { timeoutMs: 10 * 60_000, signal: context?.signal },
-      );
-      return JSON.stringify(result, null, 2);
-    },
-    metadata: {
-      ...mapCommandMetadata(
-        deps,
-        () => "Preparing and adding a vector layer to the Web map",
-        (input) => `Add ${typeof input.path === "string" ? input.path : "vector layer"} to map`,
-      ),
-      getReadPaths: (input) => readString(asRecord(input).path, "path"),
-    },
-  };
-}
-
-function createRemoveMapLayerTool(deps: MapToolDependencies): ToolSpec {
-  return createLayerCommandTool(
-    deps,
-    "map_remove_layer",
-    "Remove a loaded layer from the active Web UI map without deleting its source file.",
-    "remove_layer",
-    "Removing a layer from the Web map",
-  );
-}
-
-function createSetMapLayerVisibilityTool(deps: MapToolDependencies): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "map_set_layer_visibility",
-        description: "Show or hide a loaded layer in the active Web UI map.",
-        parameters: {
-          type: "object",
-          properties: {
-            layer: { type: "string", description: "Artifact id or exact layer name." },
-            visible: { type: "boolean" },
-          },
-          required: ["layer", "visible"],
-          additionalProperties: false,
-        },
-      },
-    },
-    handler: async (input, context) => {
-      const args = asRecord(input);
-      const layer = readString(args.layer, "layer");
-      const visible = readBoolean(args.visible, "visible");
-      const result = await deps.mapCommandBridge.execute(
-        deps.getSessionId(),
-        "set_layer_visibility",
-        { layer, visible },
-        { timeoutMs: 10_000, signal: context?.signal },
-      );
-      return JSON.stringify(result, null, 2);
-    },
-    metadata: mapCommandMetadata(
-      deps,
-      () => "Changing Web map layer visibility",
-      (input) => `${input.visible === false ? "Hide" : "Show"} layer ${typeof input.layer === "string" ? input.layer : ""}`.trim(),
-    ),
-  };
-}
-
-function createLayerCommandTool(
-  deps: MapToolDependencies,
-  name: string,
-  description: string,
-  command: "remove_layer",
-  activity: string,
-): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name,
-        description,
-        parameters: {
-          type: "object",
-          properties: { layer: { type: "string", description: "Artifact id or exact layer name." } },
-          required: ["layer"],
-          additionalProperties: false,
-        },
-      },
-    },
-    handler: async (input, context) => {
-      const layer = readString(asRecord(input).layer, "layer");
-      const result = await deps.mapCommandBridge.execute(
-        deps.getSessionId(), command, { layer }, { timeoutMs: 10_000, signal: context?.signal },
-      );
-      return JSON.stringify(result, null, 2);
-    },
-    metadata: mapCommandMetadata(
-      deps,
-      () => activity,
-      (input) => `Remove layer ${typeof input.layer === "string" ? input.layer : ""}`.trim(),
-    ),
-  };
 }
 
 function createGetMapStateTool(deps: MapToolDependencies): ToolSpec {
@@ -184,109 +24,74 @@ function createGetMapStateTool(deps: MapToolDependencies): ToolSpec {
       type: "function",
       function: {
         name: "map_get_state",
-        description: "Read the current Web UI map viewport, visible layers, and selected feature summary.",
+        description: "Read the active Web map state, including viewport, loaded layers, visualization summaries, and selected feature metadata. A separate layer-list tool is unnecessary.",
         parameters: {
           type: "object",
-          properties: {},
+          properties: {
+            include: {
+              type: "array",
+              items: { type: "string", enum: ["viewport", "layers", "selection"] },
+              description: "Optional state sections to return. Omit to return all sections.",
+            },
+          },
           additionalProperties: false,
         },
       },
     },
-    handler: async () => {
+    handler: async (input) => {
       const sessionId = deps.getSessionId();
       const state = deps.mapStateStore.get(sessionId);
-      if (!state || !deps.mapStateStore.isActive(sessionId)) {
-        throw new Error("No active Web map state is available for this session.");
+      if (!state || !deps.mapStateStore.isActive(sessionId)) throw new Error("No active Web map state is available for this session.");
+      if (!deps.mapCommandBridge.hasClient(sessionId, state.clientId)) {
+        throw new Error(`The Web map client that reported the current state is no longer connected: ${state.clientId}`);
       }
-      return JSON.stringify(state, null, 2);
+      const include = readInclude(asRecord(input).include);
+      const result: Record<string, unknown> = {
+        sessionId: state.sessionId,
+        clientId: state.clientId,
+        revision: state.revision,
+        updatedAt: state.updatedAt,
+      };
+      if (include.has("viewport")) result.viewport = { center: state.center, zoom: state.zoom, bounds: state.bounds, bearing: state.bearing, pitch: state.pitch };
+      if (include.has("layers")) result.layers = state.layers ?? [];
+      if (include.has("selection")) result.selection = state.selection ?? null;
+      return JSON.stringify(result, null, 2);
     },
     metadata: {
       source: "map",
       supportedModes: ["web"],
-      requiredCapabilities: ["map_view"],
-      isAvailable: () => deps.mapStateStore.isActive(deps.getSessionId()),
+      requiredCapabilities: ["map_view", "map_layers"],
+      isAvailable: () => {
+        const sessionId = deps.getSessionId();
+        const state = deps.mapStateStore.get(sessionId);
+        return Boolean(
+          state &&
+          deps.mapStateStore.isActive(sessionId) &&
+          deps.mapCommandBridge.hasClient(sessionId, state.clientId),
+        );
+      },
       isReadOnly: () => true,
       isConcurrencySafe: () => true,
       interruptBehavior: "cancel",
-      getActivityDescription: () => "Reading the current map state",
-      getToolUseSummary: () => "Read map viewport and layer state",
-      maxResultSizeChars: 20_000,
+      getActivityDescription: () => "Reading the current Web map state",
+      getToolUseSummary: () => "Read map viewport, layers, and selection",
+      maxResultSizeChars: 30_000,
     },
   };
 }
 
-function createSetMapViewTool(deps: MapToolDependencies): ToolSpec {
+function createInspectMapLayerTool(deps: MapToolDependencies): ToolSpec {
   return {
     definition: {
       type: "function",
       function: {
-        name: "map_set_view",
-        description: "Move the active Web UI map to a center and optional zoom, bearing, and pitch.",
+        name: "map_inspect_layer",
+        description: "Inspect one loaded Web map layer before visualization. Returns geometry types, feature count, field types, numeric ranges, and bounded unique-value samples without returning the complete dataset.",
         parameters: {
           type: "object",
           properties: {
-            center: {
-              type: "array",
-              items: { type: "number" },
-              minItems: 2,
-              maxItems: 2,
-              description: "Map center as [longitude, latitude].",
-            },
-            zoom: { type: "number", minimum: 0, maximum: 24 },
-            bearing: { type: "number", minimum: -360, maximum: 360 },
-            pitch: { type: "number", minimum: 0, maximum: 85 },
-            durationMs: { type: "integer", minimum: 0, maximum: 10_000 },
-          },
-          required: ["center"],
-          additionalProperties: false,
-        },
-      },
-    },
-    handler: async (input, context) => {
-      const args = asRecord(input);
-      const center = readCoordinate(args.center);
-      const payload = {
-        center,
-        ...(args.zoom !== undefined ? { zoom: readNumber(args.zoom, "zoom", 0, 24) } : {}),
-        ...(args.bearing !== undefined ? { bearing: readNumber(args.bearing, "bearing", -360, 360) } : {}),
-        ...(args.pitch !== undefined ? { pitch: readNumber(args.pitch, "pitch", 0, 85) } : {}),
-        durationMs: args.durationMs === undefined
-          ? 600
-          : readInteger(args.durationMs, "durationMs", 0, 10_000),
-      };
-      const result = await deps.mapCommandBridge.execute(
-        deps.getSessionId(),
-        "set_view",
-        payload,
-        { timeoutMs: payload.durationMs + 5_000, signal: context?.signal },
-      );
-      return JSON.stringify(result, null, 2);
-    },
-    metadata: mapCommandMetadata(
-      deps,
-      () => "Moving the Web map",
-      (input) => {
-        const center = Array.isArray(input.center) ? input.center.join(", ") : "requested location";
-        return `Move map to ${center}`;
-      },
-    ),
-  };
-}
-
-function createFitMapLayerTool(deps: MapToolDependencies): ToolSpec {
-  return {
-    definition: {
-      type: "function",
-      function: {
-        name: "map_fit_layer",
-        description: "Fit the active Web UI map viewport to a loaded map layer, identified by artifact id or exact layer name.",
-        parameters: {
-          type: "object",
-          properties: {
-            layer: { type: "string", description: "Artifact id or exact layer name." },
-            padding: { type: "number", minimum: 0, maximum: 300 },
-            maxZoom: { type: "number", minimum: 0, maximum: 24 },
-            durationMs: { type: "integer", minimum: 0, maximum: 10_000 },
+            layer: { type: "string", description: "Layer id or exact layer name." },
+            maxUniqueValues: { type: "integer", minimum: 2, maximum: 50, description: "Maximum unique values retained per field. Defaults to 12." },
           },
           required: ["layer"],
           additionalProperties: false,
@@ -295,81 +100,361 @@ function createFitMapLayerTool(deps: MapToolDependencies): ToolSpec {
     },
     handler: async (input, context) => {
       const args = asRecord(input);
-      const layer = readString(args.layer, "layer");
-      const durationMs = args.durationMs === undefined
-        ? 700
-        : readInteger(args.durationMs, "durationMs", 0, 10_000);
       const result = await deps.mapCommandBridge.execute(
         deps.getSessionId(),
-        "fit_layer",
+        "inspect_layer",
         {
-          layer,
-          padding: args.padding === undefined
-            ? 70
-            : readNumber(args.padding, "padding", 0, 300),
-          maxZoom: args.maxZoom === undefined
-            ? 14
-            : readNumber(args.maxZoom, "maxZoom", 0, 24),
-          durationMs,
+          layer: readString(args.layer, "layer"),
+          maxUniqueValues: args.maxUniqueValues === undefined ? 12 : readInteger(args.maxUniqueValues, "maxUniqueValues", 2, 50),
         },
-        { timeoutMs: durationMs + 10_000, signal: context?.signal },
+        commandOptions(deps, 30_000, context?.signal),
       );
       return JSON.stringify(result, null, 2);
     },
-    metadata: mapCommandMetadata(
+    metadata: {
+      ...commandMetadata(deps, () => "Inspecting a Web map layer", (input) => `Inspect layer ${typeof input.layer === "string" ? input.layer : ""}`.trim()),
+      isReadOnly: () => true,
+      isConcurrencySafe: () => true,
+      maxResultSizeChars: 30_000,
+    },
+  };
+}
+
+function createManageMapLayerTool(deps: MapToolDependencies): ToolSpec {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "map_manage_layer",
+        description: "Manage Web map layers through one operation-based interface. Add/remove/update layers; style vectors with simple/categorical/graduated modes; style rasters with grayscale, RGB composite, color relief, or hillshade. Use map_inspect_layer first when fields, bands, or value ranges are unknown.",
+        parameters: {
+          type: "object",
+          properties: {
+            operation: { type: "string", enum: ["add", "remove", "update", "visualize"] },
+            layer: { type: "string", description: "Layer id or exact name for remove, update, and visualize." },
+            source: {
+              type: "object",
+              description: "Required for add.",
+              properties: {
+                path: { type: "string", description: "Absolute or project-relative GeoJSON, SHP, GPKG, KML, GML, GeoTIFF, VRT, IMG, or ASC path." },
+                layerName: { type: "string", description: "Optional internal layer name for a multi-layer GPKG." },
+              },
+              required: ["path"],
+              additionalProperties: false,
+            },
+            options: {
+              type: "object",
+              properties: { fit: { type: "boolean", description: "Zoom to a newly added layer. Defaults to true." } },
+              additionalProperties: false,
+            },
+            changes: {
+              type: "object",
+              description: "Required for update; include visible, opacity, or both.",
+              properties: {
+                visible: { type: "boolean" },
+                opacity: { type: "number", minimum: 0, maximum: 1 },
+              },
+              additionalProperties: false,
+            },
+            visualization: {
+              type: "object",
+              description: "Required for visualize.",
+              properties: {
+                mode: { type: "string", enum: ["simple", "categorical", "graduated", "grayscale", "rgb", "color_relief", "hillshade"] },
+                field: { type: "string", description: "Required for categorical and graduated modes." },
+                band: { type: "integer", minimum: 1, description: "Raster band for grayscale, color_relief, or hillshade. Defaults to 1." },
+                bands: {
+                  type: "object",
+                  description: "Raster band mapping for RGB mode. Defaults to red=1, green=2, blue=3.",
+                  properties: {
+                    red: { type: "integer", minimum: 1 },
+                    green: { type: "integer", minimum: 1 },
+                    blue: { type: "integer", minimum: 1 },
+                  },
+                  required: ["red", "green", "blue"],
+                  additionalProperties: false,
+                },
+                minimum: { type: "number", description: "Optional raster stretch or color-relief minimum." },
+                maximum: { type: "number", description: "Optional raster stretch or color-relief maximum." },
+                zFactor: { type: "number", exclusiveMinimum: 0, description: "Hillshade vertical exaggeration. Defaults to 1." },
+                scale: { type: "number", exclusiveMinimum: 0, description: "Hillshade horizontal-to-vertical unit scale. Defaults to 111120 for the EPSG:4326 display raster." },
+                azimuth: { type: "number", minimum: 0, maximum: 360, description: "Hillshade light azimuth. Defaults to 315." },
+                altitude: { type: "number", minimum: 0, maximum: 90, description: "Hillshade light altitude. Defaults to 45." },
+                multidirectional: { type: "boolean", description: "Use multidirectional hillshade." },
+                color: { type: "string", description: "Six-digit CSS hex fallback or simple color." },
+                palette: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 12 },
+                classes: { type: "integer", minimum: 2, maximum: 9 },
+                classification: { type: "string", enum: ["quantile", "equal_interval"] },
+                opacity: { type: "number", minimum: 0, maximum: 1 },
+                pointRadius: { type: "number", minimum: 1, maximum: 30 },
+                lineWidth: { type: "number", minimum: 0.5, maximum: 20 },
+                title: { type: "string" },
+              },
+              required: ["mode"],
+              additionalProperties: false,
+            },
+          },
+          required: ["operation"],
+          additionalProperties: false,
+        },
+      },
+    },
+    handler: async (input, context) => {
+      const args = asRecord(input);
+      const operation = readEnum(args.operation, "operation", ["add", "remove", "update", "visualize"] as const);
+      let command: "add_layer" | "remove_layer" | "update_layer" | "visualize_layer";
+      let payload: Record<string, unknown>;
+      let timeoutMs = 30_000;
+      if (operation === "add") {
+        const source = readRecord(args.source, "source");
+        const options = readOptionalRecord(args.options, "options");
+        command = "add_layer";
+        payload = {
+          path: readString(source.path, "source.path"),
+          ...(source.layerName !== undefined ? { layerName: readString(source.layerName, "source.layerName") } : {}),
+          fit: options.fit === undefined ? true : readBoolean(options.fit, "options.fit"),
+        };
+        timeoutMs = 10 * 60_000;
+      } else if (operation === "remove") {
+        command = "remove_layer";
+        payload = { layer: readString(args.layer, "layer") };
+      } else if (operation === "update") {
+        const changes = readRecord(args.changes, "changes");
+        if (changes.visible === undefined && changes.opacity === undefined) throw new Error("changes must include visible or opacity.");
+        command = "update_layer";
+        payload = {
+          layer: readString(args.layer, "layer"),
+          changes: {
+            ...(changes.visible !== undefined ? { visible: readBoolean(changes.visible, "changes.visible") } : {}),
+            ...(changes.opacity !== undefined ? { opacity: readNumber(changes.opacity, "changes.opacity", 0, 1) } : {}),
+          },
+        };
+      } else {
+        command = "visualize_layer";
+        const visualization = readRecord(args.visualization, "visualization");
+        const mode = readEnum(visualization.mode, "visualization.mode", ["simple", "categorical", "graduated", "grayscale", "rgb", "color_relief", "hillshade"] as const);
+        const field = visualization.field === undefined ? undefined : readString(visualization.field, "visualization.field");
+        if ((mode === "categorical" || mode === "graduated") && !field) throw new Error(`${mode} visualization requires visualization.field.`);
+        const bands = visualization.bands === undefined ? undefined : readRecord(visualization.bands, "visualization.bands");
+        payload = {
+          layer: readString(args.layer, "layer"),
+          mode,
+          ...(field ? { field } : {}),
+          ...(visualization.color !== undefined ? { color: readHexColor(visualization.color, "visualization.color") } : {}),
+          ...(visualization.palette !== undefined ? { palette: readColorArray(visualization.palette) } : {}),
+          ...(visualization.band !== undefined ? { band: readInteger(visualization.band, "visualization.band", 1, 10_000) } : {}),
+          ...(bands ? { bands: {
+            red: readInteger(bands.red, "visualization.bands.red", 1, 10_000),
+            green: readInteger(bands.green, "visualization.bands.green", 1, 10_000),
+            blue: readInteger(bands.blue, "visualization.bands.blue", 1, 10_000),
+          } } : {}),
+          ...(visualization.minimum !== undefined ? { minimum: readFiniteNumber(visualization.minimum, "visualization.minimum") } : {}),
+          ...(visualization.maximum !== undefined ? { maximum: readFiniteNumber(visualization.maximum, "visualization.maximum") } : {}),
+          ...(visualization.zFactor !== undefined ? { zFactor: readNumber(visualization.zFactor, "visualization.zFactor", 0.000001, Number.MAX_SAFE_INTEGER) } : {}),
+          ...(visualization.scale !== undefined ? { scale: readNumber(visualization.scale, "visualization.scale", 0.000001, Number.MAX_SAFE_INTEGER) } : {}),
+          ...(visualization.azimuth !== undefined ? { azimuth: readNumber(visualization.azimuth, "visualization.azimuth", 0, 360) } : {}),
+          ...(visualization.altitude !== undefined ? { altitude: readNumber(visualization.altitude, "visualization.altitude", 0, 90) } : {}),
+          ...(visualization.multidirectional !== undefined ? { multidirectional: readBoolean(visualization.multidirectional, "visualization.multidirectional") } : {}),
+          classes: visualization.classes === undefined ? 5 : readInteger(visualization.classes, "visualization.classes", 2, 9),
+          classification: visualization.classification === undefined ? "quantile" : readEnum(visualization.classification, "visualization.classification", ["quantile", "equal_interval"] as const),
+          opacity: visualization.opacity === undefined ? 0.78 : readNumber(visualization.opacity, "visualization.opacity", 0, 1),
+          pointRadius: visualization.pointRadius === undefined ? 6 : readNumber(visualization.pointRadius, "visualization.pointRadius", 1, 30),
+          lineWidth: visualization.lineWidth === undefined ? 3 : readNumber(visualization.lineWidth, "visualization.lineWidth", 0.5, 20),
+          ...(visualization.title !== undefined ? { title: readString(visualization.title, "visualization.title").slice(0, 100) } : {}),
+        };
+        if (["grayscale", "rgb", "color_relief", "hillshade"].includes(mode)) {
+          timeoutMs = 10 * 60_000;
+        }
+      }
+      const result = await deps.mapCommandBridge.execute(
+        deps.getSessionId(),
+        command,
+        payload,
+        commandOptions(deps, timeoutMs, context?.signal),
+      );
+      return JSON.stringify(result, null, 2);
+    },
+    metadata: {
+      ...commandMetadata(
+        deps,
+        (input) => `Managing Web map layer (${typeof input.operation === "string" ? input.operation : "operation"})`,
+        (input) => `${typeof input.operation === "string" ? input.operation : "Manage"} map layer`,
+      ),
+      getReadPaths: (input) => getAddSourcePath(input),
+    },
+  };
+}
+
+function createControlMapViewTool(deps: MapToolDependencies): ToolSpec {
+  return {
+    definition: {
+      type: "function",
+      function: {
+        name: "map_control_view",
+        description: "Control the active Web map viewport. Set an explicit center/view or fit the viewport to a loaded layer.",
+        parameters: {
+          type: "object",
+          properties: {
+            operation: { type: "string", enum: ["set", "fit"] },
+            view: {
+              type: "object",
+              description: "Required for set.",
+              properties: {
+                center: { type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 },
+                zoom: { type: "number", minimum: 0, maximum: 24 },
+                bearing: { type: "number", minimum: -360, maximum: 360 },
+                pitch: { type: "number", minimum: 0, maximum: 85 },
+              },
+              required: ["center"],
+              additionalProperties: false,
+            },
+            target: {
+              type: "object",
+              description: "Required for fit.",
+              properties: { layer: { type: "string", description: "Layer id or exact layer name." } },
+              required: ["layer"],
+              additionalProperties: false,
+            },
+            options: {
+              type: "object",
+              properties: {
+                padding: { type: "number", minimum: 0, maximum: 300 },
+                maxZoom: { type: "number", minimum: 0, maximum: 24 },
+                durationMs: { type: "integer", minimum: 0, maximum: 10_000 },
+              },
+              additionalProperties: false,
+            },
+          },
+          required: ["operation"],
+          additionalProperties: false,
+        },
+      },
+    },
+    handler: async (input, context) => {
+      const args = asRecord(input);
+      const operation = readEnum(args.operation, "operation", ["set", "fit"] as const);
+      const options = readOptionalRecord(args.options, "options");
+      const durationMs = options.durationMs === undefined ? (operation === "set" ? 600 : 700) : readInteger(options.durationMs, "options.durationMs", 0, 10_000);
+      const payload: Record<string, unknown> = { durationMs };
+      const command = operation === "set" ? "set_view" : "fit_layer";
+      if (operation === "set") {
+        const view = readRecord(args.view, "view");
+        payload.center = readCoordinate(view.center);
+        if (view.zoom !== undefined) payload.zoom = readNumber(view.zoom, "view.zoom", 0, 24);
+        if (view.bearing !== undefined) payload.bearing = readNumber(view.bearing, "view.bearing", -360, 360);
+        if (view.pitch !== undefined) payload.pitch = readNumber(view.pitch, "view.pitch", 0, 85);
+      } else {
+        const target = readRecord(args.target, "target");
+        payload.layer = readString(target.layer, "target.layer");
+        payload.padding = options.padding === undefined ? 70 : readNumber(options.padding, "options.padding", 0, 300);
+        payload.maxZoom = options.maxZoom === undefined ? 14 : readNumber(options.maxZoom, "options.maxZoom", 0, 24);
+      }
+      const result = await deps.mapCommandBridge.execute(
+        deps.getSessionId(),
+        command,
+        payload,
+        commandOptions(deps, durationMs + 10_000, context?.signal),
+      );
+      return JSON.stringify(result, null, 2);
+    },
+    metadata: commandMetadata(
       deps,
-      () => "Fitting the Web map to a layer",
-      (input) => `Zoom to layer ${typeof input.layer === "string" ? input.layer : ""}`.trim(),
+      (input) => `Controlling Web map view (${typeof input.operation === "string" ? input.operation : "operation"})`,
+      (input) => `${typeof input.operation === "string" ? input.operation : "Control"} map view`,
     ),
   };
 }
 
-function mapCommandMetadata(
+function commandMetadata(
   deps: MapToolDependencies,
-  getActivityDescription: () => string,
+  getActivityDescription: (input: Record<string, unknown>) => string,
   getToolUseSummary: (input: Record<string, unknown>) => string,
 ): NonNullable<ToolSpec["metadata"]> {
   return {
     source: "map",
     supportedModes: ["web"],
     requiredCapabilities: ["map_commands"],
-    isAvailable: () => deps.mapCommandBridge.hasActiveClient(deps.getSessionId()),
+    isAvailable: () => {
+      const sessionId = deps.getSessionId();
+      const state = deps.mapStateStore.get(sessionId);
+      return Boolean(
+        state &&
+        deps.mapStateStore.isActive(sessionId) &&
+        deps.mapCommandBridge.hasClient(sessionId, state.clientId),
+      );
+    },
     isReadOnly: () => false,
     isDestructive: () => false,
     isConcurrencySafe: () => false,
     interruptBehavior: "cancel",
-    getActivityDescription,
+    getActivityDescription: (input) => getActivityDescription(asRecordOrEmpty(input)),
     getToolUseSummary: (input) => getToolUseSummary(asRecordOrEmpty(input)),
   };
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Map tool input must be an object.");
+function commandOptions(
+  deps: MapToolDependencies,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): { timeoutMs: number; signal?: AbortSignal; clientId: string } {
+  const sessionId = deps.getSessionId();
+  const state = deps.mapStateStore.get(sessionId);
+  if (!state || !deps.mapStateStore.isActive(sessionId)) {
+    throw new Error("No active Web map state is available for this session.");
   }
+  if (!deps.mapCommandBridge.hasClient(sessionId, state.clientId)) {
+    throw new Error(`The Web map client that reported the current state is no longer connected: ${state.clientId}`);
+  }
+  return {
+    timeoutMs,
+    ...(signal ? { signal } : {}),
+    clientId: state.clientId,
+  };
+}
+
+function getAddSourcePath(input: unknown): string | undefined {
+  const args = asRecordOrEmpty(input);
+  if (args.operation !== "add") return undefined;
+  const source = asRecordOrEmpty(args.source);
+  return typeof source.path === "string" && source.path.trim() ? source.path.trim() : undefined;
+}
+
+function readInclude(value: unknown): Set<"viewport" | "layers" | "selection"> {
+  if (value === undefined) return new Set(["viewport", "layers", "selection"]);
+  if (!Array.isArray(value) || value.length === 0) throw new Error("include must be a non-empty array when provided.");
+  return new Set(value.map((entry) => readEnum(entry, "include item", ["viewport", "layers", "selection"] as const)));
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Map tool input must be an object.");
   return value as Record<string, unknown>;
 }
 
 function asRecordOrEmpty(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function readRecord(value: unknown, name: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${name} must be an object.`);
+  return value as Record<string, unknown>;
+}
+
+function readOptionalRecord(value: unknown, name: string): Record<string, unknown> {
+  return value === undefined ? {} : readRecord(value, name);
 }
 
 function readCoordinate(value: unknown): [number, number] {
-  if (!Array.isArray(value) || value.length !== 2) {
-    throw new Error("center must be [longitude, latitude].");
-  }
-  return [
-    readNumber(value[0], "longitude", -180, 180),
-    readNumber(value[1], "latitude", -90, 90),
-  ];
+  if (!Array.isArray(value) || value.length !== 2) throw new Error("view.center must be [longitude, latitude].");
+  return [readNumber(value[0], "longitude", -180, 180), readNumber(value[1], "latitude", -90, 90)];
 }
 
 function readNumber(value: unknown, name: string, minimum: number, maximum: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
-    throw new Error(`${name} must be a number between ${minimum} and ${maximum}.`);
-  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) throw new Error(`${name} must be a number between ${minimum} and ${maximum}.`);
+  return value;
+}
+
+function readFiniteNumber(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`${name} must be a finite number.`);
   return value;
 }
 
@@ -380,13 +465,27 @@ function readInteger(value: unknown, name: string, minimum: number, maximum: num
 }
 
 function readString(value: unknown, name: string): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${name} must be a non-empty string.`);
-  }
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${name} must be a non-empty string.`);
   return value.trim();
 }
 
 function readBoolean(value: unknown, name: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${name} must be a boolean.`);
   return value;
+}
+
+function readEnum<const T extends readonly string[]>(value: unknown, name: string, values: T): T[number] {
+  if (typeof value !== "string" || !values.includes(value)) throw new Error(`${name} must be one of: ${values.join(", ")}.`);
+  return value as T[number];
+}
+
+function readHexColor(value: unknown, name: string): string {
+  const color = readString(value, name);
+  if (!/^#[0-9a-f]{6}$/iu.test(color)) throw new Error(`${name} must be a six-digit CSS hex color such as #2563eb.`);
+  return color;
+}
+
+function readColorArray(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 12) throw new Error("visualization.palette must contain between 2 and 12 colors.");
+  return value.map((color, index) => readHexColor(color, `visualization.palette[${index}]`));
 }

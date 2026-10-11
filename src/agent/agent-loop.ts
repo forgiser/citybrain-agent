@@ -79,6 +79,10 @@ export type AgentEvent =
 import type { AgentStatusUpdate } from "./agent-status.js";
 export type { AgentStatus, AgentStatusUpdate } from "./agent-status.js";
 
+export interface AgentRunOptions extends StreamChatOptions {
+  inputKind?: "user" | "task_notification";
+}
+
 export class AgentLoop {
   constructor(
     private readonly modelRuntime: ModelRuntime,
@@ -103,7 +107,7 @@ export class AgentLoop {
 
   async *run(
     input: string,
-    options: StreamChatOptions = {},
+    options: AgentRunOptions = {},
   ): AsyncGenerator<AgentEvent, string, undefined> {
     const runId = randomUUID();
     const harness = new HarnessController({
@@ -241,7 +245,12 @@ export class AgentLoop {
         content: input,
       } as const;
       conversationMessages.push(userMessage);
-      this.session.appendMessage(userMessage);
+      this.session.appendMessage({
+        ...userMessage,
+        ...(options.inputKind === "task_notification"
+          ? { visibility: "system" as const }
+          : {}),
+      });
 
       let finalResponse = "";
       let finalThinking = "";

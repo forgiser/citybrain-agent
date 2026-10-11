@@ -164,7 +164,7 @@ export function makeRunQgisAlgorithmTool(getRuntime: RuntimeGetter): QgisTool {
       isConcurrencySafe: isQgisAlgorithmConcurrencySafe,
       interruptBehavior: "cancel",
       supportsBackground: true,
-      backgroundAfterMs: 10_000,
+      backgroundAfterMs: 35_000,
       getPath: getQgisInputPaths,
       getReadPaths: getQgisInputPaths,
       getWritePaths: getQgisOutputParameterPaths,

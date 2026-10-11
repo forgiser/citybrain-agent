@@ -202,6 +202,17 @@ export class TaskManager {
     return taskId ? this.get<TResult>(taskId) : undefined;
   }
 
+  /** Update scheduler-owned metadata without changing task lifecycle state. */
+  updateMetadata(taskId: string, values: Record<string, unknown>): boolean {
+    const task = this.tasks.get(taskId);
+    if (!task) return false;
+    this.update(task, {
+      metadata: { ...(task.snapshot.metadata ?? {}), ...values },
+      updatedAt: this.timestamp(),
+    });
+    return true;
+  }
+
   delete(taskId: string): boolean {
     const task = this.tasks.get(taskId);
     const snapshot = task?.snapshot ?? this.store.get(taskId);

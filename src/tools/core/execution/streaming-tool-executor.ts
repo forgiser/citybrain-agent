@@ -357,10 +357,19 @@ export class StreamingToolExecutor {
       deduplicationKey,
     );
     if (existing) {
-      return createBackgroundOutcome(existing, true);
+      if (existing.metadata?.detached === true) {
+        return createBackgroundOutcome(existing, true);
+      }
+      // The existing execution is still owned by another foreground call. Do
+      // not describe it as a background task before that call has transferred
+      // ownership. Sharing the terminal promise also avoids starting the tool
+      // a second time.
+      const settled = await this.taskManager.wait<ToolExecutionOutcome>(existing.id);
+      return outcomeFromTask(settled);
     }
 
     let attached = true;
+    let removeForegroundAbort = (): void => {};
     let resolvePreflight: (() => void) | undefined;
     const preflightReady = new Promise<void>((resolve) => {
       resolvePreflight = resolve;
@@ -373,6 +382,8 @@ export class StreamingToolExecutor {
       resourceKeys: buildResourceKeys(metadata, sandbox),
       artifactPaths: metadata.writePaths ?? [],
       metadata: {
+        kind: "tool_execution",
+        detached: false,
         source: metadata.source,
         toolCallId: toolCall.id,
         runId: foregroundContext?.runId,
@@ -391,17 +402,38 @@ export class StreamingToolExecutor {
       ),
     });
 
+    const foregroundSignal = foregroundContext?.signal;
+    if (foregroundSignal) {
+      const abortForegroundTask = (): void => {
+        if (!attached) return;
+        this.taskManager?.cancel(
+          task.id,
+          "foreground Agent run cancelled before background ownership transfer",
+        );
+      };
+      foregroundSignal.addEventListener("abort", abortForegroundTask, { once: true });
+      removeForegroundAbort = () =>
+        foregroundSignal.removeEventListener("abort", abortForegroundTask);
+      if (foregroundSignal.aborted) abortForegroundTask();
+    }
+
     const terminal = this.taskManager.wait<ToolExecutionOutcome>(task.id).then(
       (snapshot) => ({ type: "terminal" as const, snapshot }),
     );
     const detach = Promise.all([
       delay(threshold),
       preflightReady,
-    ]).then(() => ({ type: "background" as const }));
+    ]).then(() => {
+      attached = false;
+      removeForegroundAbort();
+      this.taskManager?.updateMetadata(task.id, { detached: true });
+      return { type: "background" as const };
+    });
     const decision = await Promise.race([terminal, detach]);
 
     if (decision.type === "terminal") {
       attached = false;
+      removeForegroundAbort();
       return outcomeFromTask(decision.snapshot);
     }
 
@@ -515,7 +547,7 @@ function createBackgroundOutcome(
       `Task ID: ${task.id}`,
       `Task status: ${task.status}`,
       "The final result is NOT available yet.",
-      "Use get_task_status or wait_task before consuming its artifacts.",
+      "Do not poll this task. Its terminal result will be delivered automatically as a task notification.",
       artifacts,
     ].filter(Boolean).join("\n"),
   };

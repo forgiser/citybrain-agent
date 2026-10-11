@@ -7,6 +7,8 @@ export type HumanInteractionKind =
   | "destructive_confirmation"
   | "recovery_choice"
   | "clarification"
+  | "choice"
+  | "confirmation"
   | "provider_fallback";
 
 export type HumanInteractionRisk = "low" | "medium" | "high";
@@ -26,6 +28,7 @@ export interface HumanInteractionOption {
   label: string;
   description?: string;
   dangerous?: boolean;
+  recommended?: boolean;
 }
 
 export interface HumanInteractionRequestInput {

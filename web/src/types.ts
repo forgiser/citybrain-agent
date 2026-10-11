@@ -34,7 +34,12 @@ export interface Artifact {
   contentUrl?: string;
   contentType?: string;
   size?: number;
-  map?: { format: string; dataUrl?: string; crs?: string };
+  map?: {
+    format: string;
+    dataUrl?: string;
+    crs?: string;
+    coordinates?: [[number, number], [number, number], [number, number], [number, number]];
+  };
   layer?: {
     sourcePath: string;
     sourceFormat: string;
@@ -46,6 +51,12 @@ export interface Artifact {
     order: number;
     style?: Record<string, unknown>;
   };
+}
+
+export interface PendingMapLayer {
+  id: string;
+  name: string;
+  message: string;
 }
 
 export interface TaskSnapshot {
@@ -67,9 +78,10 @@ export interface RuntimeEnvelope {
 
 export interface InteractionRequest {
   requestId: string;
+  kind?: "permission" | "sandbox_access" | "destructive_confirmation" | "recovery_choice" | "clarification" | "choice" | "confirmation" | "provider_fallback";
   title: string;
   message: string;
-  options: Array<{ id: string; label: string; description?: string; dangerous?: boolean }>;
+  options: Array<{ id: string; label: string; description?: string; dangerous?: boolean; recommended?: boolean }>;
   defaultOption?: string;
   risk?: string;
 }

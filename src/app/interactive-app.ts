@@ -85,6 +85,11 @@ import {
 } from "../workspace/sandbox-policy.js";
 import { findShellCommand, shellCommands } from "./shell-commands.js";
 import { CliHumanInteractionAdapter } from "./cli-human-interaction.js";
+import {
+  formatTaskCompletionNotification,
+  isTaskTerminal,
+  isToolExecutionTask,
+} from "../task/index.js";
 
 const VERSION = "0.1.0";
 const DEFAULT_THINKING_LEVEL: ThinkingLevel = DEFAULT_RUNTIME_THINKING_LEVEL;
@@ -226,6 +231,7 @@ export async function startInteractiveApp(
 
   return new Promise<void>((resolve) => {
     let stopped = false;
+    let unsubscribeTasks: (() => void) | undefined;
     let lastCtrlCAt = 0;
     let ctrlCNotice: Text | undefined;
     let ctrlCNoticeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -233,6 +239,7 @@ export async function startInteractiveApp(
     const stop = (): void => {
       if (stopped) return;
       stopped = true;
+      unsubscribeTasks?.();
       humanInteraction.dispose();
       void runtime.dispose("application stopped");
       if (ctrlCNoticeTimer) clearTimeout(ctrlCNoticeTimer);
@@ -272,8 +279,7 @@ export async function startInteractiveApp(
       return undefined;
     });
 
-    editor.onSubmit = (value) => {
-      void handleSubmit(value, {
+    const createSubmitContext = (): SubmitContext => ({
         editor,
         agentLoop,
         authStorage,
@@ -297,7 +303,41 @@ export async function startInteractiveApp(
         transcript,
         tui,
       });
+    let submissionChain = Promise.resolve();
+    const enqueueSubmit = (
+      value: string,
+      options: HandleSubmitOptions = {},
+    ): void => {
+      submissionChain = submissionChain
+        .then(() => handleSubmit(value, createSubmitContext(), options))
+        .catch((error) => {
+          addTranscript(
+            { editor, transcript, tui },
+            new Text(colors.red(error instanceof Error ? error.message : String(error)), 2, 0),
+          );
+        });
     };
+
+    editor.onSubmit = (value) => {
+      enqueueSubmit(value);
+    };
+
+    unsubscribeTasks = runtime.taskManager.subscribe((event) => {
+      if (!isTaskTerminal(event.task.status) || !isToolExecutionTask(event.task)) return;
+      addTranscript(
+        { editor, transcript, tui },
+        new Text(
+          colors.green(
+            `Background task ${event.task.id} ${event.task.status}: ${event.task.description ?? event.task.name}`,
+          ),
+          2,
+          0,
+        ),
+      );
+      enqueueSubmit(formatTaskCompletionNotification(event.task), {
+        inputKind: "task_notification",
+      });
+    });
 
     tui.start();
     if (!qgisRuntime) {
@@ -364,16 +404,24 @@ interface SubmitContext {
   tui: TUI;
 }
 
+interface HandleSubmitOptions {
+  inputKind?: "user" | "task_notification";
+}
+
 const INIT_USE_CURRENT = "__current__";
 const INIT_CHOOSE_OTHER = "__choose__";
 
 type TranscriptContext = Pick<SubmitContext, "editor" | "transcript" | "tui">;
 
-async function handleSubmit(value: string, context: SubmitContext): Promise<void> {
+async function handleSubmit(
+  value: string,
+  context: SubmitContext,
+  options: HandleSubmitOptions = {},
+): Promise<void> {
   const input = value.trim();
   if (!input) return;
 
-  if (input.startsWith("/")) {
+  if (options.inputKind !== "task_notification" && input.startsWith("/")) {
     const command = findShellCommand(input);
 
     if (!command) {
@@ -436,10 +484,9 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
     }
   }
 
-  addTranscript(
-    context,
-    createUserMessage(input),
-  );
+  if (options.inputKind !== "task_notification") {
+    addTranscript(context, createUserMessage(input));
+  }
 
   const responseComponent = new AssistantResponseComponent();
   addTranscript(context, responseComponent);
@@ -449,6 +496,7 @@ async function handleSubmit(value: string, context: SubmitContext): Promise<void
   try {
     const eventStream = context.agentLoop.run(input, {
       thinkingLevel: context.thinkingLevel,
+      inputKind: options.inputKind,
     });
     for await (const event of eventStream) {
       if (event.type === "text") {
@@ -546,6 +594,7 @@ function renderStoredSession(
 ): void {
   for (const entry of context.session.getEntries()) {
     if (entry.type === "message") {
+      if (entry.message.visibility === "system") continue;
       if (entry.message.role === "tool" || entry.message.toolCalls?.length) {
         continue;
       }
@@ -676,14 +725,15 @@ function formatHumanRequest(
     .map((option, index) => {
       const description = option.description ? `  ${option.description}` : "";
       const prefix = index === selectedIndex ? "› " : "  ";
+      const optionLabel = `${option.label}${option.recommended ? " · recommended" : ""}`;
       const label = index === selectedIndex
-        ? colors.humanText(option.label)
-        : option.label;
+        ? colors.humanText(optionLabel)
+        : optionLabel;
       return `${prefix}${label}${description}`;
     })
     .join("\n");
   return [
-    colors.humanText("human approval required"),
+    colors.humanText(`human input required · ${request.kind}`),
     colors.humanText(request.title),
     request.message,
     colors.dim(`risk=${request.risk ?? "medium"}`),

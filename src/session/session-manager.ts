@@ -538,6 +538,9 @@ function isSessionFileEntry(value: unknown): value is SessionFileEntry {
         value.message.role === "tool") &&
       typeof value.message.content === "string" &&
       (value.message.thinking === undefined || typeof value.message.thinking === "string") &&
+      (value.message.visibility === undefined ||
+        value.message.visibility === "visible" ||
+        value.message.visibility === "system") &&
       (value.message.toolCalls === undefined || Array.isArray(value.message.toolCalls)) &&
       (value.message.toolCallId === undefined || typeof value.message.toolCallId === "string") &&
       (value.message.toolName === undefined || typeof value.message.toolName === "string") &&

@@ -72,8 +72,9 @@ export function createAgentHostProfile(mode: AgentHostMode): AgentHostProfile {
             "You are connected to a Web UI that contains a MapLibre map.",
             "The map state supplied below is observational context, not proof that a map command was executed.",
             "Only change the map through map tools that are actually present in the current tool list.",
-            "Files are never loaded onto the map implicitly. Use map_add_layer only when the user explicitly asks to display a GeoJSON file.",
-            "Use map_list_layers or map_get_state to inspect layers, map_remove_layer to remove one, map_set_layer_visibility to show or hide one, map_set_view to move the map, and map_fit_layer to zoom to a loaded layer.",
+            "Files are never loaded onto the map implicitly. Use map_add_layer only when the user explicitly asks to display a supported vector file.",
+            "Use map_get_state to inspect viewport, loaded layers, and selection. Use map_inspect_layer before thematic visualization when field names or distributions are unknown.",
+            "Use map_manage_layer with operation add, remove, update, or visualize for all layer changes. Use map_control_view with operation set or fit for viewport changes.",
             "If no map command tool is available, explain the intended map action instead of claiming it happened.",
             "Do not request or embed complete GeoJSON in the system prompt; query detailed data through tools when available.",
           ].join("\n"),
@@ -170,6 +171,7 @@ function hostEnvironmentContributor(
       `Host mode: ${label} (${mode}).`,
       `Host capabilities: ${capabilities.join(", ")}.`,
       "The concrete tool list in the current model request is authoritative; never invent a capability-specific tool.",
+      "Use request_user_input only when missing information or materially different choices prevent a safe, meaningful decision. Inspect available context first, offer bounded concrete options, recommend one when justified, and continue from the returned structured decision. Do not ask about routine reversible details that have a reasonable default.",
     ].join("\n"),
   };
 }

@@ -3,6 +3,11 @@ export interface MapLayerState {
   name: string;
   visible: boolean;
   format?: string;
+  visualization?: {
+    mode?: string;
+    field?: string;
+    title?: string;
+  };
 }
 
 export interface MapSelectionState {
@@ -47,7 +52,19 @@ export class MapStateStore {
       bounds: [...update.bounds],
       bearing: update.bearing ?? 0,
       pitch: update.pitch ?? 0,
-      layers: (update.layers ?? []).slice(0, 100).map((layer) => ({ ...layer })),
+      layers: (update.layers ?? []).slice(0, 100).map((layer) => ({
+        id: layer.id.slice(0, 200),
+        name: layer.name.slice(0, 200),
+        visible: layer.visible,
+        ...(layer.format ? { format: layer.format.slice(0, 50) } : {}),
+        ...(layer.visualization ? {
+          visualization: {
+            ...(layer.visualization.mode ? { mode: layer.visualization.mode.slice(0, 30) } : {}),
+            ...(layer.visualization.field ? { field: layer.visualization.field.slice(0, 100) } : {}),
+            ...(layer.visualization.title ? { title: layer.visualization.title.slice(0, 100) } : {}),
+          },
+        } : {}),
+      })),
       ...(update.selection
         ? { selection: sanitizeSelection(update.selection) }
         : {}),
@@ -86,7 +103,12 @@ export class MapStateStore {
       `- center: [${formatNumber(state.center[0])}, ${formatNumber(state.center[1])}]`,
       `- zoom: ${formatNumber(state.zoom)}; bearing: ${formatNumber(state.bearing ?? 0)}; pitch: ${formatNumber(state.pitch ?? 0)}`,
       `- bounds: [${state.bounds.map(formatNumber).join(", ")}]`,
-      `- layers: ${layers.length === 0 ? "none" : layers.map((layer) => `${layer.id} (${layer.visible ? "visible" : "hidden"})`).join(", ")}`,
+      `- layers: ${layers.length === 0 ? "none" : layers.map((layer) => {
+        const visualization = layer.visualization?.mode
+          ? `; style=${layer.visualization.mode}${layer.visualization.field ? `:${layer.visualization.field}` : ""}`
+          : "";
+        return `${layer.id} (${layer.visible ? "visible" : "hidden"}${visualization})`;
+      }).join(", ")}`,
     ];
     if (state.selection) {
       lines.push(
