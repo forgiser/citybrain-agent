@@ -1,7 +1,8 @@
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ArtifactService } from "../../artifacts/index.js";
 import { openInBrowser } from "../../integrations/qgis/qgis-setup.js";
 import { SessionManager } from "../../session/session-manager.js";
@@ -600,7 +601,12 @@ function readRequiredNumber(value: unknown, name: string): number {
 }
 
 async function registerWebAssets(server: FastifyInstance): Promise<void> {
-  const webRoot = resolve(process.cwd(), "dist", "web");
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const packagedWebRoot = resolve(moduleDir, "..", "..", "web");
+  const developmentWebRoot = resolve(process.cwd(), "dist", "web");
+  const webRoot = existsSync(resolve(packagedWebRoot, "index.html"))
+    ? packagedWebRoot
+    : developmentWebRoot;
   if (!existsSync(resolve(webRoot, "index.html"))) {
     server.get("/", async (_request, reply) => {
       reply.type("text/html; charset=utf-8");

@@ -1,0 +1,29 @@
+name: 发布 npm 包
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v6
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.19.0"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 发布到 npm
+        run: npm publish --access public

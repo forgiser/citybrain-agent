@@ -1,24 +1,51 @@
 {
-  "name": "citybrain",
+  "name": "citybrain-agent",
   "version": "0.1.0",
-  "private": true,
-  "description": "A Pi-style terminal shell for future urban geospatial data workflows.",
+  "description": "面向空间数据处理、分析与可视化的本地智能体",
   "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "PUBLISHING.md",
+    "docs"
+  ],
   "bin": {
-    "citybrain": "./dist/main.js"
+    "citybrain": "dist/main.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forgiser/citybrain-agent.git"
+  },
+  "homepage": "https://github.com/forgiser/citybrain-agent#readme",
+  "bugs": {
+    "url": "https://github.com/forgiser/citybrain-agent/issues"
+  },
+  "keywords": [
+    "agent",
+    "gis",
+    "qgis",
+    "geospatial",
+    "maplibre",
+    "cli"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "predev": "npm run build:web",
     "dev": "tsx src/main.ts",
     "dev:cli": "tsx src/main.ts --mode cli",
     "dev:web": "concurrently \"vite --config web/vite.config.ts\" \"tsx watch src/main.ts --mode web --no-open\"",
-    "build": "npm run build:server && npm run build:web",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && npm run build:server && npm run build:web",
     "build:server": "tsc -p tsconfig.json",
     "build:web": "vite build --config web/vite.config.ts",
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
-    "check": "npm run typecheck && npm run typecheck:web"
+    "check": "npm run typecheck && npm run typecheck:web",
+    "prepack": "npm run check && npm run build"
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.85.1",
