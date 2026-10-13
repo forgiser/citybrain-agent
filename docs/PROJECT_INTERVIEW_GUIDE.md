@@ -32,7 +32,7 @@ CityBrain 是一个面向城市空间数据分析的本地 AI Agent。它以大�
 - 不是对每一个 QGIS 算法进行硬编码封装。
 - 不是完整替代 QGIS Desktop 的专业制图系统。
 - 当前不是分布式任务平台；后台任务仍由本地 Node.js 进程托管。
-- 当前栅格地图是二维影像可视化，不是三维体数据或完整 DEM Terrain 服务。
+- DEM 已支持基于 Terrain RGB、`raster-dem` 和 `setTerrain()` 的三维地形；它是高程表面渲染，不是体数据或独立分布式瓦片平台。
 
 ## 4. 技术栈
 
@@ -44,7 +44,7 @@ CityBrain 是一个面向城市空间数据分析的本地 AI Agent。它以大�
 | CLI | Commander、Pi 风格终端 UI |
 | Web 服务 | Fastify、SSE、Node.js |
 | Web 前端 | React、Vite |
-| 地图 | MapLibre GL |
+| 地图 | MapLibre GL、Three.js、maplibre-gl-three、3d-tiles-renderer |
 | GIS 执行 | QGIS `qgis_process`、GDAL Processing 算法 |
 | 会话与日志 | JSONL、本地文件存储 |
 | 并发控制 | Promise、AbortController、TaskManager、资源键调度 |
@@ -303,7 +303,8 @@ Web 模式下，Agent 能够：
 - 调整视口或缩放到图层；
 - 检查矢量字段和数据分布；
 - 执行简单、分类、分级矢量可视化；
-- 执行栅格灰度、RGB、分级设色和山体阴影可视化。
+- 执行栅格灰度、RGB、分级设色、山体阴影和 DEM 三维地形可视化；
+- 加载带显式地理位置的 glTF、GLB、OBJ 独立模型，以及本地或远程 3D Tiles。
 
 地图命令通过 SSE 发往当前浏览器，浏览器执行后把结果返回 Bridge。工具只有收到浏览器确认才算完成，避免模型“声称地图已经变化”但前端实际没有执行。
 
@@ -330,6 +331,35 @@ GeoTIFF/VRT/IMG/ASC
 ```
 
 栅格符号化会基于原始重投影栅格重新生成显示缓存，并通过版本化 URL 热更新前端，不修改原始文件。
+
+DEM 三维链路：
+
+```text
+DEM
+  → QGIS 重投影为 EPSG:3857 高程栅格
+  → 后端按 XYZ 请求读取并重采样高程窗口
+  → Mapbox Terrain RGB 编码与磁盘缓存
+  → MapLibre raster-dem + setTerrain()
+  → 地形网格、山体阴影与倾斜视角
+```
+
+该链路不生成另一份永久业务数据，只在工作区 `.internal/map-cache` 中维护可重建的显示缓存；垂直夸张仅由前端渲染参数控制，不会重复转换 DEM。
+
+三维模型链路：
+
+```text
+本地/远程 glTF、GLB、OBJ
+  → 工作区安全校验或 HTTP(S) URL 校验
+  → Three.js Loader
+  → 经纬度/高程转换为 ECEF 变换矩阵
+  → MapLibre Custom Layer 与地图相机同步渲染
+
+本地/远程 tileset.json
+  → 3d-tiles-renderer 按需调度层级瓦片
+  → maplibre-gl-three 同步地图相机与空间坐标
+```
+
+本地模型的关联纹理、二进制缓冲和嵌套 tileset 通过受限资源接口提供，接口会再次校验资源仍位于登记的资产根目录，防止路径穿越。独立模型通常不带可靠地理参考，因此添加时必须提供经纬度；3D Tiles 则优先使用自身的空间参考。
 
 ### 7.12 Web UI 是空间工作台，而不是普通聊天页
 
@@ -411,6 +441,7 @@ QGIS 经常通过 `.bat` 配置 OSGeo4W 环境，但直接经 `cmd %*` 转发包
 - 我实现了 SHP、GPKG、KML、GML 到 WGS84 GeoJSON 的地图显示链路。
 - 我实现了 GeoTIFF、VRT、IMG、ASC 的栅格重投影、PNG 缓存、世界文件解析和四角坐标计算。
 - 我扩展统一地图工具，使栅格支持灰度、RGB、分级设色和山体阴影，并完成真实 QGIS 端到端验证。
+- 我实现了 DEM Terrain RGB 按需切片与真实高程地形渲染，并把垂直夸张保留为前端渲染参数。
 
 ### 9.4 Web GIS 交互
 
@@ -418,6 +449,7 @@ QGIS 经常通过 `.bat` 配置 OSGeo4W 环境，但直接经 `cmd %*` 转发包
 - 我实现了 Agent 到浏览器地图的命令桥，以及浏览器到 Agent 的地图状态回报。
 - 我解决了连续 `add → inspect → visualize` 时 React 状态提交延迟导致图层找不到的问题。
 - 我实现了地图图层添加、移除、显隐、透明度、视口控制和矢量专题图。
+- 我接入 Three.js、maplibre-gl-three 与 3d-tiles-renderer，使 Web 地图支持 glTF、GLB、OBJ 和 3D Tiles，并处理 ECEF 定位、关联资源安全服务和图层生命周期。
 - 我为长时间图层准备和栅格渲染补充了按钮、地图和图层面板三级 loading 状态。
 - 我实现了 Markdown 消息渲染、工具消息就地排列、会话删除/清空和自定义确认弹窗。
 
@@ -439,14 +471,14 @@ QGIS 经常通过 `.bat` 配置 OSGeo4W 环境，但直接经 `cmd %*` 转发包
 ### 10.1 精简版
 
 **CityBrain：面向城市空间分析的本地 AI Agent**  
-基于 TypeScript、React、Fastify、MapLibre 与 QGIS Processing 构建支持 CLI/Web 双模式的空间分析 Agent；设计统一 Tool Harness、动态 HITL、子智能体、上下文压缩和 Claude Code 风格后台任务机制；实现 SHP/GPKG/GeoTIFF 等数据的坐标转换、地图加载与 AI 驱动专题可视化。
+基于 TypeScript、React、Fastify、MapLibre、Three.js 与 QGIS Processing 构建支持 CLI/Web 双模式的空间分析 Agent；设计统一 Tool Harness、动态 HITL、子智能体、上下文压缩和 Claude Code 风格后台任务机制；实现 SHP/GPKG/GeoTIFF 等数据的坐标转换、AI 驱动专题可视化、DEM 地形和 3D Tiles/三维模型加载。
 
 ### 10.2 简历要点版
 
 - 设计 UI-neutral Agent Runtime 与 Host Capability 体系，在 CLI/Web 两种宿主间复用模型、会话、工具、任务和权限能力，并按模式动态组装工具与 System Prompt。
 - 构建 QGIS 元工具体系，通过运行时算法发现、参数查询和统一执行替代数百个算法的手工封装，支持进度、取消、产物校验和 Windows QGIS 环境适配。
 - 参考 Claude Code 实现长工具执行所有权转移，移除模型轮询式 `wait_task`，使用终态事件主动回注 Agent，并通过去重键和资源键治理重复执行与写冲突。
-- 实现 Agent—Web 地图双向命令桥，支持地图状态感知、矢量专题图以及 GeoTIFF 栅格灰度、RGB、分级设色和山体阴影渲染。
+- 实现 Agent—Web 地图双向命令桥，支持地图状态感知、矢量专题图、GeoTIFF 栅格渲染、DEM 地形，以及 glTF/GLB/OBJ 与 3D Tiles 三维场景加载。
 - 设计结构化动态 HITL，将澄清、方案选择、风险确认和失败恢复嵌入 CLI/Web 对话执行流。
 
 ## 11. 高频面试问题与参考回答
@@ -540,7 +572,9 @@ System Prompt 明确只有缺少信息会改变方案或存在风险时才调用
 | TaskManager 默认内存存储 | 进程退出后 runner 无法恢复 | 持久化任务队列、worker lease、启动恢复策略 |
 | 子智能体会话仍会持久化为普通会话 | Web 会话列表可能混入内部会话 | transient session 或 session kind/parentSessionId |
 | 栅格使用整幅 PNG image source | 超大栅格加载和显存压力较大 | COG、XYZ/WMTS 瓦片、金字塔缓存 |
-| 暂无三维 DEM terrain | 只能二维栅格显示 | Terrain RGB/Terrarium 瓦片、`raster-dem`、`setTerrain()` |
+| DEM 瓦片由本地进程按需生成 | 首次浏览未缓存区域存在计算开销，难以直接横向扩容 | COG/预生成金字塔、独立瓦片服务、共享缓存 |
+| 单体三维模型由浏览器完整加载 | 大模型会占用网络、内存和 GPU，缺少层级细节 | 大场景转换为 3D Tiles、压缩纹理和几何、按需加载 |
+| 远程三维资源依赖 CORS，独立模型缺少统一地理参考 | 资源服务器配置或定位参数错误会导致加载失败、位置偏移 | 资源代理、CORS 诊断、模型地理配准与定位预览 |
 | 栅格 inspect 元数据有限 | AI 对波段语义判断不足 | GDAL JSON metadata、波段统计、NoData、数据类型扫描 |
 | Sandbox 为应用层策略 | 无法抵御进程级恶意行为 | 独立系统账户、容器、受限 worker |
 | Web 主包体积较大 | 首次加载成本偏高 | React/MapLibre 动态导入和代码分包 |
@@ -551,7 +585,7 @@ System Prompt 明确只有缺少信息会改变方案或存在风险时才调用
 - 不要把项目描述为“调用 ChatGPT 加一个地图”。重点是执行 Harness、GIS Runtime 和状态闭环。
 - 不要说后台化是“新开线程”；应解释执行所有权转移与 QGIS 子进程。
 - 不要说支持所有空间格式；列出当前真实支持格式。
-- 不要说实现了三维地形；当前是二维栅格符号化。
+- 可以说明已实现 DEM 三维地形、轻量独立模型和 3D Tiles，但要准确限定为浏览器三维场景加载与交互，不要描述成完整数字孪生编辑平台或分布式瓦片平台。
 - 不要回避限制。能准确说明 transient subagent、持久任务和瓦片化方向，会比泛化宣传更有说服力。
 - 回答设计问题时尽量使用“问题—约束—方案—取舍—验证”结构。
 

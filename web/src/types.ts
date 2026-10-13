@@ -39,6 +39,28 @@ export interface Artifact {
     dataUrl?: string;
     crs?: string;
     coordinates?: [[number, number], [number, number], [number, number], [number, number]];
+    terrain?: {
+      tileUrl: string;
+      encoding: "mapbox";
+      tileSize: number;
+      minZoom: number;
+      maxZoom: number;
+      bounds: [number, number, number, number];
+      exaggeration: number;
+    };
+    scene3d?: {
+      type: "model" | "tiles3d";
+      format: "gltf" | "glb" | "obj" | "3dtiles";
+      url: string;
+      placement?: {
+        longitude: number;
+        latitude: number;
+        altitude: number;
+        scale: number;
+        rotation: [number, number, number];
+      };
+      offset?: { east: number; up: number; south: number };
+    };
   };
   layer?: {
     sourcePath: string;

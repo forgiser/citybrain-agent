@@ -50,19 +50,26 @@
   "dependencies": {
     "@earendil-works/pi-tui": "0.85.1",
     "@fastify/static": "^10.1.5",
+    "3d-tiles-renderer": "^0.5.3",
     "commander": "14.0.0",
     "fastify": "^5.12.5",
+    "geotiff": "^3.0.5",
     "maplibre-gl": "^6.13.0",
+    "maplibre-gl-three": "^3.0.2",
     "openai": "6.40.0",
+    "pngjs": "^7.0.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@types/node": "24.3.0",
+    "@types/pngjs": "^6.0.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/three": "^0.186.0",
     "@vitejs/plugin-react": "^6.1.2",
     "concurrently": "^10.0.6",
     "tsx": "4.23.13",

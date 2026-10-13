@@ -439,18 +439,37 @@ function registerApi(
     const body = asRecord(request.body);
     const session = requireSession(sessionId, sessions, runtime);
     const requestedPath = readOptionalString(body.absolutePath);
+    const requestedUrl = readOptionalString(body.url);
     const path = requestedPath
       ? resolveAgentArtifactPath(session, requestedPath)
-      : resolveWorkspacePath(
+      : requestedUrl
+        ? undefined
+        : resolveWorkspacePath(
           session,
           readRequiredString(body.rootId, "rootId"),
           readRequiredString(body.path, "path"),
         ).path;
+    const placement = isRecord(body.placement) ? body.placement : undefined;
+    const offset = isRecord(body.offset) ? body.offset : undefined;
     const layer = await mapLayers.prepare(session, {
-      path,
+      ...(path ? { path } : {}),
+      ...(requestedUrl ? { url: requestedUrl } : {}),
+      ...(body.type === "model" || body.type === "tiles3d" ? { type: body.type } : {}),
       ...(readOptionalString(body.name) ? { name: readOptionalString(body.name) } : {}),
       ...(readOptionalString(body.layerName) ? { layerName: readOptionalString(body.layerName) } : {}),
       ...(readOptionalString(body.sourceCrs) ? { sourceCrs: readOptionalString(body.sourceCrs) } : {}),
+      ...(placement ? { placement: {
+        longitude: readRequiredNumber(placement.longitude, "placement.longitude"),
+        latitude: readRequiredNumber(placement.latitude, "placement.latitude"),
+        ...(typeof placement.altitude === "number" ? { altitude: placement.altitude } : {}),
+        ...(typeof placement.scale === "number" ? { scale: placement.scale } : {}),
+        ...(Array.isArray(placement.rotation) ? { rotation: placement.rotation.map((value) => readRequiredNumber(value, "placement.rotation")) as [number, number, number] } : {}),
+      } } : {}),
+      ...(offset ? { offset: {
+        ...(typeof offset.east === "number" ? { east: offset.east } : {}),
+        ...(typeof offset.up === "number" ? { up: offset.up } : {}),
+        ...(typeof offset.south === "number" ? { south: offset.south } : {}),
+      } } : {}),
     }, runtime.getQgisRuntime());
     reply.code(201);
     return toMapArtifact(layer);
@@ -488,6 +507,7 @@ function registerApi(
       ...(typeof body.azimuth === "number" ? { azimuth: body.azimuth } : {}),
       ...(typeof body.altitude === "number" ? { altitude: body.altitude } : {}),
       ...(typeof body.multidirectional === "boolean" ? { multidirectional: body.multidirectional } : {}),
+      ...(typeof body.exaggeration === "number" ? { exaggeration: body.exaggeration } : {}),
       ...(typeof body.opacity === "number" ? { opacity: body.opacity } : {}),
       ...(readOptionalString(body.title) ? { title: readOptionalString(body.title) } : {}),
     }, runtime.getQgisRuntime());
@@ -517,6 +537,41 @@ function registerApi(
       .assertReadable(data.path);
     reply.type(data.contentType);
     return reply.send(createReadStream(data.path));
+  });
+
+  server.get("/api/map/layers/:layerId/assets/*", async (request, reply) => {
+    const params = request.params as { layerId: string; "*": string };
+    const asset = mapLayers.getAsset(params.layerId, params["*"]);
+    if (!asset) {
+      reply.code(404);
+      return { error: "3D layer asset not found." };
+    }
+    const session = requireSession(asset.sessionId, sessions, runtime);
+    SandboxPolicy.fromWorkspace(session.getWorkspaceDir(), session.getProjectDir()).assertReadable(asset.path);
+    reply.type(asset.contentType).header("Cache-Control", "no-cache");
+    return reply.send(createReadStream(asset.path));
+  });
+
+  server.get("/api/map/layers/:layerId/terrain/:z/:x/:y", async (request, reply) => {
+    const { layerId, z: rawZ, x: rawX, y: rawY } = request.params as Record<string, string>;
+    const parseTileCoordinate = (value: string, name: string): number => {
+      if (!/^\d+$/u.test(value)) throw new Error(`${name} must be a non-negative integer.`);
+      return Number(value);
+    };
+    const tile = await mapLayers.getTerrainTile(
+      layerId,
+      parseTileCoordinate(rawZ, "z"),
+      parseTileCoordinate(rawX, "x"),
+      parseTileCoordinate(rawY, "y"),
+    );
+    if (!tile) {
+      reply.code(404);
+      return { error: "Terrain layer or tile not found." };
+    }
+    requireSession(tile.sessionId, sessions, runtime);
+    if (!tile.data) return reply.code(204).send();
+    reply.type("image/png").header("Cache-Control", "public, max-age=31536000, immutable");
+    return reply.send(tile.data);
   });
 
   server.get("/api/artifacts", async (request) => {
@@ -571,10 +626,12 @@ function toMapArtifact(layer: PreparedMapLayer): Record<string, unknown> {
     size: layer.sizeBytes,
     contentUrl: layer.dataUrl,
     map: {
-      format: layer.kind === "raster" ? "raster-image" : "geojson",
+      format: layer.kind === "raster" ? "raster-image" : layer.kind === "model" ? "model3d" : layer.kind === "tiles3d" ? "3d-tiles" : "geojson",
       dataUrl: layer.dataUrl,
       crs: layer.displayCrs,
       ...(layer.coordinates ? { coordinates: layer.coordinates } : {}),
+      ...(layer.terrain ? { terrain: layer.terrain } : {}),
+      ...(layer.scene3d ? { scene3d: layer.scene3d } : {}),
     },
     layer: {
       sourcePath: layer.sourcePath,
@@ -590,9 +647,9 @@ function toMapArtifact(layer: PreparedMapLayer): Record<string, unknown> {
   };
 }
 
-function readRasterVisualizationMode(value: unknown): "grayscale" | "rgb" | "color_relief" | "hillshade" {
-  if (value === "grayscale" || value === "rgb" || value === "color_relief" || value === "hillshade") return value;
-  throw new Error("Raster visualization mode must be grayscale, rgb, color_relief, or hillshade.");
+function readRasterVisualizationMode(value: unknown): "grayscale" | "rgb" | "color_relief" | "hillshade" | "terrain" {
+  if (value === "grayscale" || value === "rgb" || value === "color_relief" || value === "hillshade" || value === "terrain") return value;
+  throw new Error("Raster visualization mode must be grayscale, rgb, color_relief, hillshade, or terrain.");
 }
 
 function readRequiredNumber(value: unknown, name: string): number {

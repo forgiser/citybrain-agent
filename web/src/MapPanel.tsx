@@ -9,6 +9,11 @@ import {
   type ExpressionSpecification,
   type GeoJSONSource,
 } from "maplibre-gl";
+import { ThreeDManager, type ThreeDTilesAsset, type ThreeLayer } from "maplibre-gl-three";
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { MTLLoader } from "three/examples/jsm/loaders/MTLLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import mapLibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
 import { api } from "./api";
 import { getWebClientId } from "./clientId";
@@ -19,6 +24,18 @@ setWorkerUrl(mapLibreWorkerUrl);
 // map.loaded() becomes false again while sources, tiles, or animations are
 // active. Commands only need the style to have initialized once.
 const initializedMaps = new WeakSet<MapLibreMap>();
+const terrainExaggerations = new WeakMap<MapLibreMap, Map<string, number>>();
+interface Scene3dEntry {
+  layer: ThreeLayer;
+  object: THREE.Object3D;
+  tilesAsset?: ThreeDTilesAsset;
+}
+interface Scene3dRuntime {
+  manager: ThreeDManager;
+  entries: Map<string, Scene3dEntry>;
+  loading: Map<string, Promise<void>>;
+}
+const scene3dRuntimes = new WeakMap<MapLibreMap, Promise<Scene3dRuntime>>();
 
 interface MapPanelProps {
   sessionId?: string;
@@ -98,6 +115,7 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
           } : {},
           layers: baseMap === "osm" ? [{ id: "osm", type: "raster", source: "osm" }] : [],
         },
+        canvasContextAttributes: { antialias: true },
       });
     } catch (error) {
       setMapError(error instanceof Error ? error.message : String(error));
@@ -177,6 +195,7 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
           body: JSON.stringify({ clientId: clientIdRef.current }),
         }).catch(() => undefined);
       }
+      destroyScene3dRuntime(map);
       map.remove();
       mapRef.current = null;
     };
@@ -190,7 +209,7 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
     const nextArtifacts = [...artifacts];
     const nextIds = new Set(nextArtifacts.map((artifact) => artifact.id));
     for (const artifact of artifactsRef.current) {
-      if (!nextIds.has(artifact.id) && map?.getSource(`source-${artifact.id}`)) {
+      if (!nextIds.has(artifact.id) && (map?.getSource(`source-${artifact.id}`) || map?.getLayer(`model3d-${artifact.id}`))) {
         nextArtifacts.push(artifact);
       }
     }
@@ -223,7 +242,7 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
           command = JSON.parse(event.data) as MapCommandEnvelope;
           if (command.command === "add_layer" || command.command === "visualize_layer") {
             pendingId = `command:${command.id}`;
-            const source = command.command === "add_layer" ? command.payload.path : command.payload.layer;
+            const source = command.command === "add_layer" ? (command.payload.path ?? command.payload.url) : command.payload.layer;
             const path = typeof source === "string" ? source : "地图图层";
             const name = path.split(/[\\/]/u).at(-1) || "地图图层";
             setCommandLoads((value) => [{
@@ -311,19 +330,50 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
       if (cancelled) return;
       const activeIds = new Set(artifacts.map((artifact) => artifact.id));
       for (const layer of map.getStyle().layers ?? []) {
-        const artifactId = layer.id.match(/^(?:fill|line|point|raster)-(.+)$/u)?.[1];
-        if (artifactId && !activeIds.has(artifactId) && map.getLayer(layer.id)) map.removeLayer(layer.id);
+        const artifactId = layer.id.match(/^(?:fill|line|point|raster|hillshade|model3d)-(.+)$/u)?.[1];
+        if (artifactId && !activeIds.has(artifactId)) removeMapLayer(map, artifactId);
       }
       for (const sourceId of Object.keys(map.getStyle().sources ?? {})) {
         const artifactId = sourceId.startsWith("source-") ? sourceId.slice("source-".length) : undefined;
-        if (artifactId && !activeIds.has(artifactId) && map.getSource(sourceId)) map.removeSource(sourceId);
+        if (artifactId && !activeIds.has(artifactId) && map.getSource(sourceId)) removeMapLayer(map, artifactId);
       }
       for (const artifact of artifacts) {
         if (artifact.status !== "ready" || !isDisplayMapArtifact(artifact) || !artifact.map?.dataUrl) continue;
         const sourceId = `source-${artifact.id}`;
-        if (map.getSource(sourceId)) continue;
+        if (map.getSource(sourceId) || map.getLayer(`model3d-${artifact.id}`)) continue;
+        if (artifact.map.scene3d) {
+          void addScene3dLayer(map, artifact, autoFit)
+            .then(() => {
+              if (cancelled || mapRef.current !== map) return;
+              setLayerErrors((value) => {
+                const next = new Map(value);
+                next.delete(artifact.id);
+                return next;
+              });
+              if (sessionId) {
+                void reportMapState(
+                  map,
+                  sessionId,
+                  clientIdRef.current,
+                  artifactsRef.current,
+                  hiddenLayersRef.current,
+                  selectionRef.current,
+                );
+              }
+            })
+            .catch((error: unknown) => {
+              if (cancelled) return;
+              setLayerErrors((value) => new Map(value).set(
+                artifact.id,
+                error instanceof Error ? error.message : String(error),
+              ));
+            });
+          continue;
+        }
         if (artifact.map.format === "raster-image") {
-          void addRasterImageLayer(map, artifact, autoFit)
+          void (artifact.map.terrain
+            ? addTerrainLayer(map, artifact, autoFit)
+            : addRasterImageLayer(map, artifact, autoFit))
             .then(() => {
               if (cancelled || mapRef.current !== map) return;
               setLayerErrors((value) => {
@@ -487,6 +537,10 @@ export function MapPanel({ sessionId, artifacts, pendingLayers, autoFit, baseMap
   async function zoomTo(artifact: Artifact) {
     const map = mapRef.current;
     if (!map || !artifact.map?.dataUrl) return;
+    if (artifact.map.scene3d) {
+      await fitScene3dLayer(map, artifact, 700);
+      return;
+    }
     if (artifact.map.format === "raster-image") {
       fitRasterCoordinates(map, requireRasterCoordinates(artifact));
       return;
@@ -578,7 +632,9 @@ async function reportMapState(
       layers: artifacts
         // Only publish layers that MapLibre has actually loaded. React/backend
         // records may exist while a source is still loading or after it failed.
-        .filter((artifact) => artifact.map && map.getSource(`source-${artifact.id}`))
+        .filter((artifact) => artifact.map && (
+          map.getSource(`source-${artifact.id}`) || map.getLayer(`model3d-${artifact.id}`)
+        ))
         .map((artifact) => ({
           id: artifact.id,
           name: artifact.name,
@@ -622,35 +678,47 @@ async function executeMapCommand(
     const layer = String(envelope.payload.layer ?? "").trim();
     const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
     if (!artifact?.map?.dataUrl) throw new Error(`Map layer not found or not ready: ${layer}`);
-    const rasterCoordinates = artifact.map.format === "raster-image"
-      ? requireRasterCoordinates(artifact)
-      : undefined;
-    const geojson = rasterCoordinates ? undefined : await loadArtifactGeoJson(artifact);
-    await runMapMovement(map, durationMs, () => {
-      const fitOptions = {
-        padding: readCommandNumber(envelope.payload.padding, 70),
-        maxZoom: readCommandNumber(envelope.payload.maxZoom, 14),
-        duration: durationMs,
-      };
-      if (rasterCoordinates) {
-        fitRasterCoordinates(map, rasterCoordinates, fitOptions);
-      } else {
-        fitGeoJson(map, geojson!, fitOptions);
-      }
-    });
+    if (artifact.map.scene3d) {
+      await fitScene3dLayer(map, artifact, durationMs);
+    } else {
+      const rasterCoordinates = artifact.map.format === "raster-image"
+        ? requireRasterCoordinates(artifact)
+        : undefined;
+      const geojson = rasterCoordinates ? undefined : await loadArtifactGeoJson(artifact);
+      await runMapMovement(map, durationMs, () => {
+        const fitOptions = {
+          padding: readCommandNumber(envelope.payload.padding, 70),
+          maxZoom: readCommandNumber(envelope.payload.maxZoom, 14),
+          duration: durationMs,
+        };
+        if (rasterCoordinates) {
+          fitRasterCoordinates(map, rasterCoordinates, fitOptions);
+        } else {
+          fitGeoJson(map, geojson!, fitOptions);
+        }
+      });
+    }
   } else if (envelope.command === "add_layer") {
-    const path = readCommandString(envelope.payload.path, "path");
+    const path = typeof envelope.payload.path === "string" ? readCommandString(envelope.payload.path, "path") : undefined;
+    const url = typeof envelope.payload.url === "string" ? readCommandString(envelope.payload.url, "url") : undefined;
+    if (Boolean(path) === Boolean(url)) throw new Error("Add layer requires exactly one of path or url.");
     const artifact = await api<Artifact>(`/api/sessions/${sessionId}/map/layers`, {
       method: "POST",
       body: JSON.stringify({
-        absolutePath: path,
+        ...(path ? { absolutePath: path } : {}),
+        ...(url ? { url } : {}),
+        ...(envelope.payload.sourceType === "model" || envelope.payload.sourceType === "tiles3d"
+          ? { type: envelope.payload.sourceType }
+          : {}),
+        ...(isCommandRecord(envelope.payload.placement) ? { placement: envelope.payload.placement } : {}),
+        ...(isCommandRecord(envelope.payload.offset) ? { offset: envelope.payload.offset } : {}),
         ...(typeof envelope.payload.layerName === "string" && envelope.payload.layerName.trim()
           ? { layerName: envelope.payload.layerName.trim() }
           : {}),
       }),
     });
     if (artifact.status !== "ready" || !isDisplayMapArtifact(artifact) || !artifact.map?.dataUrl) {
-      throw new Error(`The file could not be prepared as a display-ready map layer: ${path}`);
+      throw new Error(`The source could not be prepared as a display-ready map layer: ${path ?? url}`);
     }
     await addPreparedMapLayer(map, artifact, envelope.payload.fit !== false);
     handlers.onLayerAdded(artifact);
@@ -707,6 +775,17 @@ async function executeMapCommand(
     const layer = readCommandString(envelope.payload.layer, "layer");
     const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
     if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
+    if (artifact.map?.scene3d) {
+      return {
+        id: artifact.id,
+        name: artifact.name,
+        kind: artifact.map.scene3d.type,
+        format: artifact.map.scene3d.format,
+        url: artifact.map.scene3d.url,
+        placement: artifact.map.scene3d.placement,
+        offset: artifact.map.scene3d.offset,
+      };
+    }
     if (artifact.map?.format === "raster-image") {
       return {
         id: artifact.id,
@@ -724,14 +803,16 @@ async function executeMapCommand(
     const layer = readCommandString(envelope.payload.layer, "layer");
     const artifact = artifacts.find((item) => item.id === layer || item.name === layer);
     if (!artifact) throw new Error(`Loaded map layer not found: ${layer}`);
+    if (artifact.map?.scene3d) throw new Error("3D model and 3D Tiles styling is configured when the layer is added; raster/vector visualization modes do not apply.");
     if (artifact.map?.format === "raster-image") {
-      const mode = readCommandEnum(envelope.payload.mode, "mode", ["grayscale", "rgb", "color_relief", "hillshade"] as const);
+      const mode = readCommandEnum(envelope.payload.mode, "mode", ["grayscale", "rgb", "color_relief", "hillshade", "terrain"] as const);
       const updated = await api<Artifact>(`/api/sessions/${sessionId}/map/layers/${artifact.id}/visualize`, {
         method: "POST",
         body: JSON.stringify({ ...envelope.payload, mode }),
       });
       removeMapLayer(map, artifact.id);
-      await addRasterImageLayer(map, updated, false);
+      if (updated.map?.terrain) await addTerrainLayer(map, updated, false);
+      else await addRasterImageLayer(map, updated, false);
       if (hiddenLayers.has(artifact.id)) setMapLayerVisibility(map, artifact.id, false);
       handlers.onLayerAdded(updated);
       reportedArtifacts = [updated, ...artifacts.filter((item) => item.id !== artifact.id)];
@@ -1027,11 +1108,211 @@ function paletteColor(palette: string[], index: number, total: number): string {
 }
 
 async function addPreparedMapLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
+  if (artifact.map?.scene3d) {
+    await addScene3dLayer(map, artifact, fit);
+    return;
+  }
   if (artifact.map?.format === "raster-image") {
-    await addRasterImageLayer(map, artifact, fit);
+    if (artifact.map.terrain) await addTerrainLayer(map, artifact, fit);
+    else await addRasterImageLayer(map, artifact, fit);
     return;
   }
   await addGeoJsonLayer(map, artifact, fit);
+}
+
+async function ensureScene3dRuntime(map: MapLibreMap): Promise<Scene3dRuntime> {
+  const existing = scene3dRuntimes.get(map);
+  if (existing) return existing;
+  const initializing = (async (): Promise<Scene3dRuntime> => {
+    const manager = new ThreeDManager({ verticalDatum: { enabled: false } });
+    await manager.init();
+    return { manager, entries: new Map(), loading: new Map() };
+  })();
+  scene3dRuntimes.set(map, initializing);
+  return initializing;
+}
+
+async function addScene3dLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
+  const scene = artifact.map?.scene3d;
+  if (!scene) throw new Error(`3D scene metadata is unavailable: ${artifact.name}`);
+  const runtime = await ensureScene3dRuntime(map);
+  if (runtime.entries.has(artifact.id)) {
+    if (fit) await fitScene3dLayer(map, artifact, 700);
+    return;
+  }
+  const pending = runtime.loading.get(artifact.id);
+  if (pending) {
+    await pending;
+    if (fit) await fitScene3dLayer(map, artifact, 700);
+    return;
+  }
+  const loading = (async (): Promise<void> => {
+    const layer = runtime.manager.createLayer({
+      id: `model3d-${artifact.id}`,
+      separatorBefore: false,
+      separatorAfter: false,
+    });
+    let object: THREE.Object3D;
+    let tilesAsset: ThreeDTilesAsset | undefined;
+    try {
+      if (scene.type === "tiles3d") {
+        tilesAsset = await layer.load3dTiles({
+          tilesetUrl: scene.url,
+          offset: scene.offset ?? { east: 0, up: 0, south: 0 },
+        });
+        object = tilesAsset.getObject3D();
+      } else {
+        object = await loadModelObject(scene.url, scene.format);
+        const placement = scene.placement;
+        if (!placement) throw new Error(`3D model placement is unavailable: ${artifact.name}`);
+        object.rotation.set(
+          THREE.MathUtils.degToRad(placement.rotation[0]),
+          THREE.MathUtils.degToRad(placement.rotation[1]),
+          THREE.MathUtils.degToRad(placement.rotation[2]),
+        );
+        object.scale.multiplyScalar(placement.scale);
+        const positioned = new THREE.Group();
+        positioned.applyMatrix4(runtime.manager.getEcefMatrix({
+          point: [placement.longitude, placement.latitude],
+          height: placement.altitude,
+        }));
+        positioned.add(object);
+        object = positioned;
+        const ambient = new THREE.HemisphereLight(0xffffff, 0x263238, 2.2);
+        const directional = new THREE.DirectionalLight(0xffffff, 2.5);
+        directional.position.set(100, 200, 100);
+        layer.three.getScene().add(ambient, directional);
+        layer.three.getScene().add(object);
+      }
+      runtime.entries.set(artifact.id, { layer, object, ...(tilesAsset ? { tilesAsset } : {}) });
+      map.addLayer(layer);
+      setScene3dOpacity(object, artifact.layer?.opacity ?? 1);
+      if (fit) await fitScene3dLayer(map, artifact, 700);
+    } catch (error) {
+      if (!layer.isDestroyed()) layer.destroy();
+      throw error;
+    }
+  })();
+  runtime.loading.set(artifact.id, loading);
+  try { await loading; }
+  finally { runtime.loading.delete(artifact.id); }
+}
+
+async function loadModelObject(url: string, format: "gltf" | "glb" | "obj" | "3dtiles"): Promise<THREE.Object3D> {
+  if (format === "gltf" || format === "glb") {
+    return (await new GLTFLoader().loadAsync(url)).scene;
+  }
+  if (format !== "obj") throw new Error(`Unsupported standalone 3D model format: ${format}`);
+  const loader = new OBJLoader();
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Unable to load OBJ model: HTTP ${response.status}`);
+  const source = await response.text();
+  const materialFile = /^\s*mtllib\s+(.+)$/imu.exec(source)?.[1]?.trim();
+  if (materialFile) {
+    const materialUrl = new URL(materialFile, new URL(url, window.location.href)).href;
+    const materials = await new MTLLoader().loadAsync(materialUrl);
+    materials.preload();
+    loader.setMaterials(materials);
+  }
+  return loader.parse(source);
+}
+
+async function fitScene3dLayer(map: MapLibreMap, artifact: Artifact, durationMs: number): Promise<void> {
+  const scene = artifact.map?.scene3d;
+  if (!scene) return;
+  let center: [number, number] | undefined;
+  if (scene.placement) center = [scene.placement.longitude, scene.placement.latitude];
+  if (!center && scene.type === "tiles3d") {
+    const runtime = await scene3dRuntimes.get(map);
+    const renderer = runtime?.entries.get(artifact.id)?.tilesAsset?.getTilesRenderer();
+    const asset = runtime?.entries.get(artifact.id)?.tilesAsset;
+    let reference = asset?.getReference();
+    if (!reference && renderer) {
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          renderer.removeEventListener("load-root-tileset", finish);
+          resolve();
+        };
+        renderer.addEventListener("load-root-tileset", finish);
+        window.setTimeout(finish, 10_000);
+      });
+      reference = asset?.getReference();
+    }
+    if (reference) center = reference.point;
+  }
+  if (!center) {
+    map.easeTo({ pitch: Math.max(map.getPitch(), 60), duration: durationMs });
+    return;
+  }
+  await runMapMovement(map, durationMs, () => {
+    map.easeTo({ center, zoom: Math.max(map.getZoom(), 17), pitch: Math.max(map.getPitch(), 60), duration: durationMs });
+  });
+}
+
+function setScene3dOpacity(object: THREE.Object3D, opacity: number): void {
+  object.traverse((child) => {
+    if (!(child instanceof THREE.Mesh)) return;
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    for (const material of materials) {
+      material.transparent = opacity < 1;
+      material.opacity = opacity;
+      material.needsUpdate = true;
+    }
+  });
+}
+
+function destroyScene3dEntry(map: MapLibreMap, artifactId: string): void {
+  const runtime = scene3dRuntimes.get(map);
+  if (!runtime) return;
+  void runtime.then((value) => {
+    const entry = value.entries.get(artifactId);
+    if (!entry) return;
+    value.entries.delete(artifactId);
+    if (!entry.layer.isDestroyed()) entry.layer.destroy();
+  }).catch(() => undefined);
+}
+
+function destroyScene3dRuntime(map: MapLibreMap): void {
+  const runtime = scene3dRuntimes.get(map);
+  scene3dRuntimes.delete(map);
+  if (runtime) void runtime.then((value) => value.manager.destroy()).catch(() => undefined);
+}
+
+async function addTerrainLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
+  const terrain = artifact.map?.terrain;
+  if (!terrain) throw new Error(`Terrain metadata is unavailable: ${artifact.name}`);
+  const sourceId = `source-${artifact.id}`;
+  if (!map.getSource(sourceId)) {
+    map.addSource(sourceId, {
+      type: "raster-dem",
+      tiles: [terrain.tileUrl],
+      tileSize: terrain.tileSize,
+      minzoom: terrain.minZoom,
+      maxzoom: terrain.maxZoom,
+      bounds: terrain.bounds,
+      encoding: terrain.encoding,
+    });
+    map.addLayer({
+      id: `hillshade-${artifact.id}`,
+      type: "hillshade",
+      source: sourceId,
+      paint: {
+        "hillshade-exaggeration": 0.35,
+        "hillshade-shadow-color": "#172014",
+        "hillshade-highlight-color": "#f4f1dc",
+        "hillshade-accent-color": "#5d6d53",
+      },
+    });
+  }
+  let settings = terrainExaggerations.get(map);
+  if (!settings) {
+    settings = new Map();
+    terrainExaggerations.set(map, settings);
+  }
+  settings.set(artifact.id, terrain.exaggeration);
+  map.setTerrain({ source: sourceId, exaggeration: terrain.exaggeration });
+  if (fit) fitRasterCoordinates(map, requireRasterCoordinates(artifact));
+  if (map.getPitch() < 35) map.easeTo({ pitch: 55, duration: 600 });
 }
 
 async function addRasterImageLayer(map: MapLibreMap, artifact: Artifact, fit: boolean): Promise<void> {
@@ -1091,19 +1372,33 @@ async function addGeoJsonLayer(map: MapLibreMap, artifact: Artifact, fit: boolea
 }
 
 function removeMapLayer(map: MapLibreMap, artifactId: string): void {
-  for (const prefix of ["fill", "line", "point", "raster"]) {
+  destroyScene3dEntry(map, artifactId);
+  for (const prefix of ["fill", "line", "point", "raster", "hillshade"]) {
     const id = `${prefix}-${artifactId}`;
     if (map.getLayer(id)) map.removeLayer(id);
   }
   const sourceId = `source-${artifactId}`;
+  if (map.getTerrain()?.source === sourceId) map.setTerrain(null);
   if (map.getSource(sourceId)) map.removeSource(sourceId);
+  terrainExaggerations.get(map)?.delete(artifactId);
 }
 
 function setMapLayerVisibility(map: MapLibreMap, artifactId: string, visible: boolean): void {
-  for (const prefix of ["fill", "line", "point", "raster"]) {
+  for (const prefix of ["fill", "line", "point", "raster", "hillshade"]) {
     const id = `${prefix}-${artifactId}`;
     if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
   }
+  const sourceId = `source-${artifactId}`;
+  const exaggeration = terrainExaggerations.get(map)?.get(artifactId);
+  if (exaggeration !== undefined) {
+    if (visible) map.setTerrain({ source: sourceId, exaggeration });
+    else if (map.getTerrain()?.source === sourceId) map.setTerrain(null);
+  }
+  const runtime = scene3dRuntimes.get(map);
+  if (runtime) void runtime.then((value) => {
+    const entry = value.entries.get(artifactId);
+    if (entry) entry.object.visible = visible;
+  }).catch(() => undefined);
 }
 
 function setMapLayerOpacity(map: MapLibreMap, artifactId: string, opacity: number): void {
@@ -1111,10 +1406,18 @@ function setMapLayerOpacity(map: MapLibreMap, artifactId: string, opacity: numbe
   if (map.getLayer(`line-${artifactId}`)) map.setPaintProperty(`line-${artifactId}`, "line-opacity", opacity);
   if (map.getLayer(`point-${artifactId}`)) map.setPaintProperty(`point-${artifactId}`, "circle-opacity", opacity);
   if (map.getLayer(`raster-${artifactId}`)) map.setPaintProperty(`raster-${artifactId}`, "raster-opacity", opacity);
+  const runtime = scene3dRuntimes.get(map);
+  if (runtime) void runtime.then((value) => {
+    const entry = value.entries.get(artifactId);
+    if (entry) setScene3dOpacity(entry.object, opacity);
+  }).catch(() => undefined);
 }
 
 function isDisplayMapArtifact(artifact: Artifact): boolean {
-  return artifact.map?.format === "geojson" || artifact.map?.format === "raster-image";
+  return artifact.map?.format === "geojson"
+    || artifact.map?.format === "raster-image"
+    || artifact.map?.format === "model3d"
+    || artifact.map?.format === "3d-tiles";
 }
 
 function requireRasterCoordinates(
@@ -1233,6 +1536,10 @@ function readCommandBoolean(value: unknown, name: string): boolean {
 function readCommandRecord(value: unknown, name: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${name} must be an object.`);
   return value as Record<string, unknown>;
+}
+
+function isCommandRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function fitGeoJson(
