@@ -55,6 +55,8 @@ export interface ContextBuildInputs {
   artifactSummary?: string;
   /** Compact summary of queued/running/recent background tasks. */
   taskSummary?: string;
+  /** Live MCP server names, connection states, and tool counts; no full schemas. */
+  mcpSummary?: string;
   /** Location and freshness of the generated, Agent-readable workspace profile. */
   workspaceProfileSummary?: string;
   /** Absolute paths the agent is rooted in (for workspace awareness). */

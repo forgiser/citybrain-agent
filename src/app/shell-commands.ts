@@ -38,6 +38,11 @@ export const shellCommands: ShellCommand[] = [
     argumentHint: "[setup|detect|list [filter]|info <algo>|use <path>|clear]",
   },
   {
+    name: "/mcp",
+    description: "注册、连接并管理外接 MCP 服务",
+    argumentHint: "[add <name> <command> [args...]|add-http <name> <url>|list|test <name>|tools <name>|enable <name>|disable <name>|remove <name>]",
+  },
+  {
     name: "/workspace",
     description: "创建、切换或查看当前 CityBrain 工作区",
     argumentHint: "[<path>|info|add-read|remove-read]",

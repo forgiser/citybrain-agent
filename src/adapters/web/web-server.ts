@@ -92,6 +92,18 @@ function registerApi(
   settings: WebSettingsService,
   sessions: Map<string, SessionManager>,
 ): void {
+  server.addHook("onRequest", async (request, reply) => {
+    if (!request.url.startsWith("/api/settings/mcp/") || request.method === "GET") return;
+    const origin = request.headers.origin;
+    if (!origin) return;
+    try {
+      const parsed = new URL(origin);
+      if (parsed.host === request.headers.host && parsed.protocol === `${request.protocol}:`) return;
+    } catch {
+      // Reject malformed Origin values as well as cross-origin browser requests.
+    }
+    return reply.code(403).send({ error: "Cross-origin MCP configuration requests are not allowed." });
+  });
   server.get("/api/health", async () => ({ ok: true }));
 
   server.get("/api/bootstrap", async () => ({
@@ -355,6 +367,35 @@ function registerApi(
     return settings.configureQgis(readRequiredString(body.path, "path"));
   });
   server.delete("/api/settings/qgis", async () => settings.clearQgis());
+
+  server.get("/api/settings/mcp/servers", async () => ({ servers: runtime.mcpService.list() }));
+  server.put("/api/settings/mcp/servers", async (request) => ({
+    server: await runtime.mcpService.upsert(request.body),
+  }));
+  server.delete("/api/settings/mcp/servers/:name", async (request) => {
+    const { name } = request.params as { name: string };
+    return { removed: await runtime.mcpService.remove(name) };
+  });
+  server.patch("/api/settings/mcp/servers/:name", async (request) => {
+    const { name } = request.params as { name: string };
+    const body = asRecord(request.body);
+    if (typeof body.enabled !== "boolean") throw new Error("enabled must be boolean.");
+    return { server: await runtime.mcpService.setEnabled(name, body.enabled) };
+  });
+  server.post("/api/settings/mcp/servers/:name/connect", async (request) => {
+    const { name } = request.params as { name: string };
+    return { server: await runtime.mcpService.connect(name) };
+  });
+  server.post("/api/settings/mcp/servers/:name/disconnect", async (request) => {
+    const { name } = request.params as { name: string };
+    await runtime.mcpService.disconnect(name);
+    return { server: runtime.mcpService.list().find((entry) => entry.name === name) };
+  });
+  server.get("/api/settings/mcp/servers/:name/tools", async (request) => {
+    const { name } = request.params as { name: string };
+    const query = request.query as { refresh?: string };
+    return { tools: await runtime.mcpService.listTools(name, query.refresh === "true") };
+  });
 
   server.get("/api/sessions/:sessionId/map-commands", async (request, reply) => {
     const { sessionId } = request.params as { sessionId: string };

@@ -41,6 +41,8 @@ import { VisualizationStateStore } from "./visualization-state-store.js";
 import { WorkspaceProfileScheduler, formatWorkspaceProfilePrompt } from "../profile/index.js";
 import { AgentObservabilityService } from "../observability/index.js";
 import { WorkflowService } from "../workflow/index.js";
+import { McpService } from "../mcp/mcp-service.js";
+import { createMcpTools } from "../mcp/mcp-tools.js";
 
 export const DEFAULT_RUNTIME_THINKING_LEVEL: ThinkingLevel = "high";
 
@@ -66,6 +68,7 @@ export async function createAgentRuntime(
   const mapStateStore = new MapStateStore();
   const mapCommandBridge = new MapCommandBridge();
   const visualizationStateStore = new VisualizationStateStore();
+  const mcpService = new McpService();
   const modelRuntime = new ModelRuntime(authStorage);
   const session =
     options.session ?? SessionManager.create(options.cwd ?? process.cwd());
@@ -166,6 +169,7 @@ export async function createAgentRuntime(
   });
   toolRegistry.registerMany(createTaskManagementTools(taskManager));
   toolRegistry.registerMany(createHumanInteractionTools({ humanInteractionBroker }));
+  toolRegistry.registerMany(createMcpTools(mcpService));
   toolRegistry.registerMany(createMapTools({
     getSessionId: () => currentSession.getSessionId(),
     mapStateStore,
@@ -188,6 +192,7 @@ export async function createAgentRuntime(
         : undefined,
       artifactSummary: formatArtifactSummary(toolRegistry.artifacts.snapshot()),
       taskSummary: formatBackgroundTaskSummary(taskManager.list()),
+      mcpSummary: mcpService.summary(),
       workspaceProfileSummary: formatWorkspaceProfilePrompt(
         currentSession.getProjectDir(),
         currentSession.getWorkspaceDir(),
@@ -249,6 +254,7 @@ export async function createAgentRuntime(
     profileScheduler,
     observability,
     workflows,
+    mcpService,
     unsubscribeHumanInteractionLog,
     unsubscribeProfileTaskEvents,
     unsubscribeTaskObservability,

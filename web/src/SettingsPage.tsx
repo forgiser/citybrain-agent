@@ -43,7 +43,7 @@ const MENU: Array<{ title: string; items: Array<{ id: SettingsSection; label: st
     { id: "tasks", label: "后台任务", description: "历史、恢复与产物" },
   ] },
   { title: "扩展与安全", items: [
-    { id: "tools", label: "工具与 MCP", description: "工具启用策略", planned: true },
+    { id: "tools", label: "工具与 MCP", description: "外接服务与工具发现" },
     { id: "security", label: "权限与安全", description: "沙箱和操作确认", planned: true },
   ] },
 ];
@@ -127,7 +127,8 @@ export function SettingsPage({ settings, options: initialOptions, sessionId, onC
         {section === "workflows" && <WorkflowPanel sessionId={sessionId} />}
         {section === "eval" && <EvalPanel sessionId={sessionId} />}
         {section === "tasks" && <TaskHistoryPanel sessionId={sessionId} />}
-        {(["tools", "security"] as SettingsSection[]).includes(section) && <PlannedSettings section={section} />}
+        {section === "tools" && <McpSettingsPanel onNotice={setNotice} />}
+        {section === "security" && <PlannedSettings section={section} />}
       </main>
     </div>
   </div>;
@@ -587,6 +588,137 @@ function SettingsModule({ eyebrow, title, description, children }: { eyebrow: st
 
 function SettingField({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return <div className="setting-field"><div><strong>{title}</strong><small>{description}</small></div><div>{children}</div></div>;
+}
+
+interface McpServerView {
+  name: string;
+  transport: "stdio" | "http";
+  enabled: boolean;
+  description?: string;
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  envVars?: string[];
+  url?: string;
+  headerEnv?: Record<string, string>;
+  status: "disabled" | "disconnected" | "connecting" | "connected" | "error";
+  toolCount?: number;
+  error?: string;
+}
+
+interface McpToolInfo {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+}
+
+function McpSettingsPanel({ onNotice }: {
+  onNotice: (value: { kind: "ok" | "error"; text: string }) => void;
+}) {
+  const [servers, setServers] = useState<McpServerView[]>([]);
+  const [name, setName] = useState("");
+  const [transport, setTransport] = useState<"stdio" | "http">("stdio");
+  const [description, setDescription] = useState("");
+  const [command, setCommand] = useState("");
+  const [args, setArgs] = useState("");
+  const [cwd, setCwd] = useState("");
+  const [envVars, setEnvVars] = useState("");
+  const [url, setUrl] = useState("");
+  const [headerEnv, setHeaderEnv] = useState("");
+  const [busy, setBusy] = useState<string>();
+  const [expanded, setExpanded] = useState<string>();
+  const [tools, setTools] = useState<McpToolInfo[]>([]);
+  const [confirmRemove, setConfirmRemove] = useState<string>();
+
+  async function refresh() {
+    const result = await api<{ servers: McpServerView[] }>("/api/settings/mcp/servers");
+    setServers(result.servers);
+  }
+
+  useEffect(() => { void refresh().catch((error) => onNotice({ kind: "error", text: errorMessage(error) })); }, []);
+
+  function edit(server: McpServerView) {
+    setName(server.name); setTransport(server.transport);
+    setDescription(server.description ?? ""); setCommand(server.command ?? "");
+    setArgs((server.args ?? []).join("\n")); setCwd(server.cwd ?? "");
+    setEnvVars((server.envVars ?? []).join(", ")); setUrl(server.url ?? "");
+    setHeaderEnv(Object.entries(server.headerEnv ?? {}).map(([key, value]) => `${key}=${value}`).join("\n"));
+  }
+
+  async function act(label: string, action: () => Promise<void>) {
+    setBusy(label);
+    try {
+      await action();
+      await refresh();
+      onNotice({ kind: "ok", text: `${label}完成。` });
+    } catch (error) {
+      onNotice({ kind: "error", text: errorMessage(error) });
+    } finally {
+      setBusy(undefined);
+    }
+  }
+
+  async function saveServer() {
+    const headerMap = Object.fromEntries(headerEnv.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean).map((line) => {
+      const index = line.indexOf("=");
+      if (index <= 0 || index === line.length - 1) throw new Error("Header 配置应为 Header-Name=ENV_VAR，每行一项。");
+      return [line.slice(0, index).trim(), line.slice(index + 1).trim()];
+    }));
+    await api("/api/settings/mcp/servers", { method: "PUT", body: JSON.stringify({
+      name: name.trim(), transport, description: description.trim(), enabled: servers.find((server) => server.name === name.trim())?.enabled ?? true,
+      ...(transport === "stdio" ? {
+        command: command.trim(), args: args.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean),
+        cwd: cwd.trim(), envVars: envVars.split(",").map((part) => part.trim()).filter(Boolean),
+      } : { url: url.trim(), headerEnv: headerMap }),
+    }) });
+  }
+
+  async function showTools(server: McpServerView) {
+    if (expanded === server.name) { setExpanded(undefined); return; }
+    await act(`发现 ${server.name} 的工具`, async () => {
+      const result = await api<{ tools: McpToolInfo[] }>(`/api/settings/mcp/servers/${encodeURIComponent(server.name)}/tools?refresh=true`);
+      setTools(result.tools); setExpanded(server.name);
+    });
+  }
+
+  return <SettingsModule eyebrow="MCP EXTENSIONS" title="工具与 MCP" description="配置本地 stdio 或 Streamable HTTP MCP 服务。Agent 只读取服务摘要，按需发现并调用工具；每次远端工具执行都需要确认。">
+    <div className="mcp-server-list">
+      {servers.length === 0 && <p className="mcp-empty">尚未配置 MCP 服务。</p>}
+      {servers.map((server) => <div className="mcp-server" key={server.name}>
+        <div className="mcp-server-head"><div><strong>{server.name}</strong><small>{server.transport} · {server.status}{server.toolCount === undefined ? "" : ` · ${server.toolCount} 个工具`}</small>{server.description && <p>{server.description}</p>}{server.error && <p className="mcp-error">{server.error}</p>}</div>
+          <div className="mcp-actions">
+            <button disabled={Boolean(busy)} onClick={() => edit(server)}>编辑</button>
+            <button disabled={Boolean(busy) || !server.enabled} onClick={() => void act(`连接 ${server.name}`, async () => { await api(`/api/settings/mcp/servers/${encodeURIComponent(server.name)}/connect`, { method: "POST", body: "{}" }); })}>连接</button>
+            {server.status === "connected" && <button disabled={Boolean(busy)} onClick={() => void act(`断开 ${server.name}`, async () => { await api(`/api/settings/mcp/servers/${encodeURIComponent(server.name)}/disconnect`, { method: "POST", body: "{}" }); })}>断开</button>}
+            <button disabled={Boolean(busy) || !server.enabled} onClick={() => void showTools(server)}>工具</button>
+            <button disabled={Boolean(busy)} onClick={() => void act(`${server.enabled ? "停用" : "启用"} ${server.name}`, async () => { await api(`/api/settings/mcp/servers/${encodeURIComponent(server.name)}`, { method: "PATCH", body: JSON.stringify({ enabled: !server.enabled }) }); })}>{server.enabled ? "停用" : "启用"}</button>
+            <button disabled={Boolean(busy)} onClick={() => {
+              if (confirmRemove !== server.name) { setConfirmRemove(server.name); return; }
+              setConfirmRemove(undefined);
+              void act(`移除 ${server.name}`, async () => { await api(`/api/settings/mcp/servers/${encodeURIComponent(server.name)}`, { method: "DELETE" }); if (expanded === server.name) setExpanded(undefined); });
+            }}>{confirmRemove === server.name ? "确认移除" : "移除"}</button>
+            {confirmRemove === server.name && <button disabled={Boolean(busy)} onClick={() => setConfirmRemove(undefined)}>取消</button>}
+          </div>
+        </div>
+        {expanded === server.name && <div className="mcp-tool-list">{tools.map((tool) => <details key={tool.name}><summary>{tool.name} — {tool.description ?? "无描述"}</summary><pre>{JSON.stringify(tool.inputSchema, null, 2)}</pre></details>)}</div>}
+      </div>)}
+    </div>
+    <div className="mcp-form"><h3>注册或更新服务</h3>
+      <SettingField title="服务名称" description="同名保存会更新配置；名称只能包含字母、数字、_ 和 -。"><input value={name} onChange={(event) => setName(event.target.value)} placeholder="filesystem" /></SettingField>
+      <SettingField title="传输方式" description="本地程序使用 stdio；网络服务使用 Streamable HTTP。"><select value={transport} onChange={(event) => setTransport(event.target.value as "stdio" | "http")}><option value="stdio">stdio</option><option value="http">Streamable HTTP</option></select></SettingField>
+      <SettingField title="用途说明" description="简要说明会进入 Agent 的动态 System Prompt。"><input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="查询外部数据服务" /></SettingField>
+      {transport === "stdio" ? <>
+        <SettingField title="启动命令" description="可执行文件名称或绝对路径；只会在连接时启动。"><input value={command} onChange={(event) => setCommand(event.target.value)} placeholder="npx" /></SettingField>
+        <SettingField title="命令参数" description="每行一个参数，不经 shell 拼接。"><textarea value={args} onChange={(event) => setArgs(event.target.value)} placeholder={"-y\n@modelcontextprotocol/server-filesystem\nE:/data"} /></SettingField>
+        <SettingField title="工作目录" description="留空则继承当前进程目录。"><input value={cwd} onChange={(event) => setCwd(event.target.value)} /></SettingField>
+        <SettingField title="额外环境变量" description="只填写变量名，逗号分隔；值从启动 CityBrain 的环境继承，不写入配置文件。"><input value={envVars} onChange={(event) => setEnvVars(event.target.value)} placeholder="MY_API_KEY" /></SettingField>
+      </> : <>
+        <SettingField title="服务 URL" description="使用 http 或 https 的 MCP endpoint。"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="http://127.0.0.1:3000/mcp" /></SettingField>
+        <SettingField title="认证 Header" description="每行 Header-Name=ENV_VAR；变量值来自本机环境，不保存令牌。"><textarea value={headerEnv} onChange={(event) => setHeaderEnv(event.target.value)} placeholder="Authorization=MY_MCP_AUTH_HEADER" /></SettingField>
+      </>}
+      <div className="mcp-actions"><button disabled={Boolean(busy)} onClick={() => void act(`保存 ${name || "MCP 服务"}`, saveServer)}>保存服务</button></div>
+    </div>
+  </SettingsModule>;
 }
 
 function PlannedSettings({ section }: { section: SettingsSection }) {

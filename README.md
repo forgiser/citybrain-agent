@@ -249,6 +249,25 @@ project/citybrain/
 
 地图状态只记录中心点、缩放级别、图层元数据和选择信息，不会把完整 GeoJSON、Markdown 或 CSV 内容塞入系统提示词。这样既保留界面感知能力，也避免上下文迅速膨胀。
 
+### 外接 MCP 工具
+
+CLI 和 Web UI 共用本机用户目录下的 `mcp-servers.json`。支持本地 stdio 服务和 Streamable HTTP 服务；配置不会自动启动服务，连接或工具发现时才建立连接。Web UI 在「设置 → 工具与 MCP」中注册、启停、连接和查看工具。
+
+```bash
+citybrain mcp add-stdio demo node /absolute/path/to/mcp-server.js
+citybrain mcp add-http remote https://example.com/mcp --header-env Authorization=MY_MCP_AUTH_HEADER
+citybrain mcp list
+citybrain mcp test demo
+citybrain mcp tools demo
+citybrain mcp inspect demo tool_name
+citybrain mcp disable demo
+citybrain mcp remove demo
+```
+
+`--env VAR1,VAR2` 可将指定环境变量传给 stdio 子进程；`--header-env Header=VAR` 从环境变量读取 HTTP Header 值，密钥本身不写入配置文件。CLI 交互界面还提供 `/mcp` 命令查看和管理已有服务。
+
+Agent 的动态 System Prompt 只包含服务名称、状态和简要描述。需要使用外部能力时，依次通过 `mcp_list_servers`、`mcp_list_tools`、`mcp_inspect_tool`、`mcp_call_tool` 选择并执行；完整 schema 仅在查看某个工具时加载。MCP 调用通过现有工具执行日志和 HITL 权限链路，远端工具每次调用均需用户确认。只应注册可信任的 MCP 服务：本地 stdio 服务能够运行所配置的程序，远端服务的行为也无法由本地文件沙箱直接约束。
+
 ## 分层安装与配置
 
 ### 第一层：基础环境
@@ -616,7 +635,8 @@ npm run build
 - 远程三维模型和 3D Tiles 由浏览器直接请求，资源服务器必须正确配置 CORS；独立模型没有地理参考时必须显式提供经纬度定位。
 - 部分地图可视化能力依赖浏览器在线且命令桥连接正常。
 - 子智能体使用纯内存临时会话隔离上下文，不生成普通会话 JSONL，也不会出现在 Web 会话列表中。
-- Web 设置菜单已按模块扩展，但部分规划中的工具、MCP、权限和高级后台策略尚未接入。
+- MCP 已支持 stdio 和 Streamable HTTP 的工具发现与调用；MCP Resources/Prompts、OAuth 和旧版 SSE 尚未接入。远端工具无法由本地工作区沙箱约束，因此 Agent 每次调用都需要用户确认。
+- Web 设置菜单中的高级工具启用策略、权限细项和后台策略仍有待集成。
 - 项目仍需要补充更完整的端到端测试、地图并发测试和异常恢复测试。
 
 ## 后续方向

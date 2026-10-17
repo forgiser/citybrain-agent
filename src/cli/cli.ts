@@ -8,6 +8,7 @@ import { createAgentHostProfile } from "../host/index.js";
 import { runWorkspaceProfileWorker } from "../profile/index.js";
 import { runEvalCli } from "../eval/eval-cli.js";
 import { runWorkflowCli } from "../workflow/workflow-cli.js";
+import { runMcpCli } from "../mcp/mcp-cli.js";
 
 type LaunchMode = "cli" | "web";
 
@@ -26,7 +27,7 @@ function buildProgram(): Command {
     .option("--mode <mode>", "launch mode: cli or web")
     .option("--port <port>", "local Web UI port", "3170")
     .option("--no-open", "do not open the browser automatically")
-    .addHelpText("after", "\n独立命令：\n  citybrain eval --help\n  citybrain workflow --help\nCLI 交互命令：/observe、/workflow\n");
+    .addHelpText("after", "\n独立命令：\n  citybrain eval --help\n  citybrain workflow --help\n  citybrain mcp --help\nCLI 交互命令：/observe、/workflow、/mcp\n");
 }
 
 export async function runCli(argv: string[]): Promise<void> {
@@ -36,6 +37,10 @@ export async function runCli(argv: string[]): Promise<void> {
   }
   if (argv[2] === "workflow") {
     await runWorkflowCli(argv.slice(3));
+    return;
+  }
+  if (argv[2] === "mcp") {
+    await runMcpCli(argv.slice(3));
     return;
   }
   if (argv[2] === "__profile-worker") {

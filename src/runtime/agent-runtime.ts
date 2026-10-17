@@ -17,6 +17,7 @@ import type { VisualizationStateStore } from "./visualization-state-store.js";
 import type { WorkspaceProfileScheduler } from "../profile/index.js";
 import type { AgentObservabilityService } from "../observability/index.js";
 import type { WorkflowService } from "../workflow/index.js";
+import type { McpService } from "../mcp/mcp-service.js";
 
 export interface AgentRuntimeDependencies {
   authStorage: AuthStorage;
@@ -38,6 +39,7 @@ export interface AgentRuntimeDependencies {
   profileScheduler: WorkspaceProfileScheduler;
   observability: AgentObservabilityService;
   workflows: WorkflowService;
+  mcpService: McpService;
   unsubscribeHumanInteractionLog?: () => void;
   unsubscribeProfileTaskEvents?: () => void;
   unsubscribeTaskObservability?: () => void;
@@ -68,6 +70,7 @@ export class AgentRuntime {
   readonly profileScheduler: WorkspaceProfileScheduler;
   readonly observability: AgentObservabilityService;
   readonly workflows: WorkflowService;
+  readonly mcpService: McpService;
 
   private session: SessionManager;
   private qgisRuntime: QgisRuntimeInfo | undefined;
@@ -101,6 +104,7 @@ export class AgentRuntime {
     this.profileScheduler = dependencies.profileScheduler;
     this.observability = dependencies.observability;
     this.workflows = dependencies.workflows;
+    this.mcpService = dependencies.mcpService;
     this.unsubscribeHumanInteractionLog =
       dependencies.unsubscribeHumanInteractionLog;
     this.unsubscribeProfileTaskEvents = dependencies.unsubscribeProfileTaskEvents;
@@ -161,6 +165,7 @@ export class AgentRuntime {
     this.humanInteractionBroker.cancelAll(reason);
     this.taskManager.dispose(reason);
     this.mapCommandBridge.dispose(reason);
+    await this.mcpService.dispose();
   }
 
   private assertActive(): void {

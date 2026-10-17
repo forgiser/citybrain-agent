@@ -50,12 +50,15 @@
     "smoke:observability": "npm run build:server && node scripts/observability-smoke.mjs",
     "smoke:p0": "npm run build:server && node scripts/p0-smoke.mjs",
     "smoke:subagent": "npm run build:server && node scripts/subagent-smoke.mjs",
+    "smoke:mcp": "npm run build:server && node scripts/mcp-smoke.mjs",
+    "smoke:mcp-web": "npm run build:server && node scripts/mcp-web-smoke.mjs",
     "eval": "npm run build:server && node dist/main.js eval",
     "prepack": "npm run check && npm run build"
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.85.1",
     "@fastify/static": "^10.1.5",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "3d-tiles-renderer": "^0.5.3",
     "commander": "14.0.0",
     "fastify": "^5.12.5",

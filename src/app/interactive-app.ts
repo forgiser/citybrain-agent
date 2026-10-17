@@ -96,6 +96,7 @@ import {
 } from "../observability/index.js";
 import type { WorkflowService } from "../workflow/index.js";
 import { evaluateRecordedRun, loadBuiltInEvalCases } from "../eval/index.js";
+import type { McpService } from "../mcp/mcp-service.js";
 
 const VERSION = "0.1.0";
 const DEFAULT_THINKING_LEVEL: ThinkingLevel = DEFAULT_RUNTIME_THINKING_LEVEL;
@@ -296,6 +297,7 @@ export async function startInteractiveApp(
         session,
         observability: runtime.observability,
         workflows: runtime.workflows,
+        mcpService: runtime.mcpService,
         taskManager: runtime.taskManager,
         setSession,
         setThinkingLevel: (level) => {
@@ -402,6 +404,7 @@ interface SubmitContext {
   session: SessionManager;
   observability: AgentObservabilityService;
   workflows: WorkflowService;
+  mcpService: McpService;
   taskManager: TaskManager;
   setSession: (session: SessionManager) => void;
   qgisRuntime: QgisRuntimeInfo | undefined;
@@ -480,6 +483,9 @@ async function handleSubmit(
         return;
       case "/qgis":
         await handleQgisCommand(getCommandArgument(input), context);
+        return;
+      case "/mcp":
+        await handleMcpCommand(getCommandArgument(input), context);
         return;
       case "/workspace":
         await handleWorkspaceCommand(getCommandArgument(input), context);
@@ -1644,6 +1650,104 @@ async function handleThinkingCommand(
   context.setThinkingLevel(normalized);
   addTranscript(context, new Text(colors.green(`Thinking level: ${normalized}`), 2, 0));
   updateModelStatus(context);
+}
+
+async function handleMcpCommand(argument: string | undefined, context: SubmitContext): Promise<void> {
+  try {
+    const [action = "list", name, ...args] = parseMcpCommandArguments(argument ?? "");
+    let result: unknown;
+    switch (action) {
+      case "list": result = context.mcpService.list(); break;
+      case "add":
+      case "add-stdio": {
+        const [command, ...commandArgs] = args;
+        if (!name || !command) {
+          throw new Error("用法：/mcp add <name> <command> [args...]，例如 /mcp add source-coop uvx source-coop-mcp");
+        }
+        if (context.mcpService.list().some((server) => server.name === name)) {
+          throw new Error(`MCP 服务 ${name} 已存在；请先移除，避免覆盖现有配置。`);
+        }
+        await context.mcpService.upsert({
+          name, transport: "stdio", command, args: commandArgs, enabled: true,
+        });
+        addTranscript(context, new Text(`已注册 MCP 服务 ${name}，正在连接并发现工具…`, 2, 0));
+        try {
+          result = { server: await context.mcpService.connect(name), tools: await context.mcpService.listTools(name) };
+        } catch (error) {
+          throw new Error(`MCP 服务 ${name} 已保存，但连接失败：${error instanceof Error ? error.message : String(error)}。检查启动命令和网络后可运行 /mcp test ${name} 重试。`);
+        }
+        break;
+      }
+      case "add-http": {
+        const [url] = args;
+        if (!name || !url || args.length !== 1) {
+          throw new Error("用法：/mcp add-http <name> <url>");
+        }
+        if (context.mcpService.list().some((server) => server.name === name)) {
+          throw new Error(`MCP 服务 ${name} 已存在；请先移除，避免覆盖现有配置。`);
+        }
+        await context.mcpService.upsert({ name, transport: "http", url, enabled: true });
+        addTranscript(context, new Text(`已注册 MCP 服务 ${name}，正在连接并发现工具…`, 2, 0));
+        try {
+          result = { server: await context.mcpService.connect(name), tools: await context.mcpService.listTools(name) };
+        } catch (error) {
+          throw new Error(`MCP 服务 ${name} 已保存，但连接失败：${error instanceof Error ? error.message : String(error)}。检查地址后可运行 /mcp test ${name} 重试。`);
+        }
+        break;
+      }
+      case "test":
+      case "connect":
+        if (!name) throw new Error("用法：/mcp test <name>");
+        result = { server: await context.mcpService.connect(name), tools: await context.mcpService.listTools(name) };
+        break;
+      case "tools":
+        if (!name) throw new Error("用法：/mcp tools <name>");
+        result = await context.mcpService.listTools(name);
+        break;
+      case "enable":
+      case "disable":
+        if (!name) throw new Error(`用法：/mcp ${action} <name>`);
+        result = await context.mcpService.setEnabled(name, action === "enable");
+        break;
+      case "remove":
+        if (!name) throw new Error("用法：/mcp remove <name>");
+        result = { removed: await context.mcpService.remove(name) };
+        break;
+      default:
+        throw new Error("用法：/mcp [list|add <name> <command> [args...]|add-http <name> <url>|test <name>|tools <name>|enable <name>|disable <name>|remove <name>]");
+    }
+    addTranscript(context, new Text(JSON.stringify(result, null, 2), 2, 0));
+  } catch (error) {
+    addTranscript(context, new Text(colors.red(error instanceof Error ? error.message : String(error)), 2, 0));
+  }
+}
+
+function parseMcpCommandArguments(input: string): string[] {
+  const args: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let started = false;
+  for (const char of input) {
+    if (quote) {
+      if (char === quote) quote = undefined;
+      else current += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (/\s/u.test(char)) {
+      if (started) {
+        args.push(current);
+        current = "";
+        started = false;
+      }
+    } else {
+      current += char;
+      started = true;
+    }
+  }
+  if (quote) throw new Error("MCP 命令的引号未闭合。");
+  if (started) args.push(current);
+  return args;
 }
 
 async function handleQgisCommand(

@@ -35,6 +35,7 @@ export function App() {
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("sessions");
   const [settings, setSettings] = useState<WebSettings>();
   const [settingsOptions, setSettingsOptions] = useState<SettingsOptions>({ thinkingLevels: [], models: [], providers: [] });
+  const [composerSettingBusy, setComposerSettingBusy] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(location.pathname === "/settings");
   const [runId, setRunId] = useState<string>();
   const [runStatus, setRunStatus] = useState("idle");
@@ -272,6 +273,19 @@ export function App() {
     source.onerror = () => setError("事件连接暂时中断，浏览器会自动重连。");
   }
 
+  async function updateComposerSetting(patch: Pick<WebSettings, "thinkingLevel"> | Pick<WebSettings, "selectedModel">) {
+    if (composerSettingBusy || runStatus === "running" || runStatus === "waiting_for_human" || runStatus === "queued") return;
+    setComposerSettingBusy(true);
+    setError(undefined);
+    try {
+      setSettings(await api<WebSettings>("/api/settings", { method: "PATCH", body: JSON.stringify(patch) }));
+    } catch (cause) {
+      setError(`切换模型或思考等级失败：${messageOf(cause)}`);
+    } finally {
+      setComposerSettingBusy(false);
+    }
+  }
+
   function handleRuntimeEvent(envelope: RuntimeEnvelope) {
     if (envelope.type === "task.notification") {
       const task = envelope.data.task as TaskSnapshot | undefined;
@@ -424,6 +438,10 @@ export function App() {
           interaction={interaction}
           available={Boolean(current)}
           running={runStatus === "running" || runStatus === "waiting_for_human" || runStatus === "queued"}
+          settings={settings}
+          settingsOptions={settingsOptions}
+          settingBusy={composerSettingBusy}
+          onSettingChange={updateComposerSetting}
           onSend={sendMessage}
           onCancel={cancelRun}
           onAnswer={answerInteraction}
@@ -621,11 +639,15 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
   </div>;
 }
 
-function ChatPanel({ messages, interaction, available, running, onSend, onCancel, onAnswer }: {
+function ChatPanel({ messages, interaction, available, running, settings, settingsOptions, settingBusy, onSettingChange, onSend, onCancel, onAnswer }: {
   messages: Message[];
   interaction?: InteractionRequest;
   available: boolean;
   running: boolean;
+  settings?: WebSettings;
+  settingsOptions: SettingsOptions;
+  settingBusy: boolean;
+  onSettingChange: (patch: Pick<WebSettings, "thinkingLevel"> | Pick<WebSettings, "selectedModel">) => Promise<void>;
   onSend: (input: string) => void;
   onCancel: () => void;
   onAnswer: (id: string) => void | Promise<void>;
@@ -636,7 +658,7 @@ function ChatPanel({ messages, interaction, available, running, onSend, onCancel
     bottom.current?.scrollIntoView({ behavior: "smooth" });
   }, [interaction, messages]);
   function submit() {
-    if (!available || !input.trim() || running) return;
+    if (!available || !input.trim() || running || settingBusy) return;
     const value = input;
     setInput("");
     void onSend(value);
@@ -662,8 +684,49 @@ function ChatPanel({ messages, interaction, available, running, onSend, onCancel
       <div ref={bottom} />
     </div>
     <div className="composer">
-      <textarea disabled={!available} value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); } }} placeholder={available ? "描述你的空间分析任务…" : "请先选择或创建会话"} />
-      {running ? <button className="stop" onClick={onCancel}>停止</button> : <button disabled={!available} onClick={submit}>发送 ↑</button>}
+      <div className="composer-surface">
+        <textarea
+          aria-label="输入对话消息"
+          disabled={!available}
+          value={input}
+          onChange={(event) => setInput(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit(); } }}
+          placeholder={available ? "描述你的空间分析任务…" : "请先选择或创建会话"}
+        />
+        <div className="composer-toolbar">
+          <div className="composer-controls">
+            <label className="composer-select composer-model" title="选择后续对话使用的模型">
+              <span>模型</span>
+              <select
+                aria-label="选择模型"
+                value={settings?.selectedModel ?? ""}
+                disabled={running || settingBusy || settingsOptions.models.length === 0}
+                onChange={(event) => void onSettingChange({ selectedModel: event.target.value })}
+              >
+                <option value="" disabled>{settingsOptions.models.length ? "选择模型" : "暂无可用模型"}</option>
+                {settingsOptions.models.map((model) => <option key={model.reference} value={model.reference}>{model.provider} / {model.name}</option>)}
+              </select>
+            </label>
+            <label className="composer-select composer-thinking" title="设置后续对话的思考等级">
+              <span>思考</span>
+              <select
+                aria-label="选择思考等级"
+                value={settings?.thinkingLevel ?? "high"}
+                disabled={running || settingBusy || !settings}
+                onChange={(event) => void onSettingChange({ thinkingLevel: event.target.value as WebSettings["thinkingLevel"] })}
+              >
+                <option value="off">关闭</option>
+                <option value="high">较高</option>
+                <option value="max">最高</option>
+              </select>
+            </label>
+          </div>
+          {running
+            ? <button type="button" className="composer-action stop" onClick={onCancel} aria-label="停止生成">停止</button>
+            : <button type="button" className="composer-action send" disabled={!available || !input.trim() || settingBusy} onClick={submit} aria-label="发送消息">发送 <span aria-hidden="true">↑</span></button>}
+        </div>
+      </div>
+      <span className="composer-hint">Enter 发送 · Shift + Enter 换行{settingBusy ? " · 正在应用设置…" : ""}</span>
     </div>
   </aside>;
 }
