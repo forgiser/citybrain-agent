@@ -10,6 +10,9 @@ export interface TaskStore {
   get(taskId: string): TaskSnapshot | undefined;
   list(): TaskSnapshot[];
   delete(taskId: string): boolean;
+  getByIdempotencyKey?(key: string): TaskSnapshot | undefined;
+  recordEvent?(event: import("./task-types.js").TaskEvent): void;
+  close?(): void;
 }
 
 export class InMemoryTaskStore implements TaskStore {
@@ -21,6 +24,11 @@ export class InMemoryTaskStore implements TaskStore {
 
   get(taskId: string): TaskSnapshot | undefined {
     const task = this.tasks.get(taskId);
+    return task ? cloneTaskSnapshot(task) : undefined;
+  }
+
+  getByIdempotencyKey(key: string): TaskSnapshot | undefined {
+    const task = [...this.tasks.values()].find((item) => item.idempotencyKey === key);
     return task ? cloneTaskSnapshot(task) : undefined;
   }
 
@@ -61,6 +69,7 @@ export function cloneTaskSnapshot<TResult>(
         }
       : {}),
     ...(task.metadata ? { metadata: { ...task.metadata } } : {}),
+    ...(task.recoveryPayload ? { recoveryPayload: structuredClone(task.recoveryPayload) } : {}),
     ...(task.result !== undefined
       ? { result: cloneUnknown(task.result) as TResult }
       : {}),

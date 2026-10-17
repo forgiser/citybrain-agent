@@ -19,10 +19,33 @@ export interface Message {
   toolStatus?: "running" | "completed" | "failed" | "background";
   toolSummary?: string;
   toolArguments?: string;
+  subagentTrace?: SubagentTrace;
+}
+
+export interface SubagentTraceStep {
+  type: "text" | "thinking" | "tool_started" | "tool_result";
+  delta?: string;
+  name?: string;
+  toolCallId?: string;
+  argumentsText?: string;
+  result?: string;
+  ok?: boolean;
+  status?: string;
+  activityDescription?: string;
+  toolUseSummary?: string;
+}
+
+export interface SubagentTrace {
+  parentToolCallId: string;
+  subagentType: string;
+  label: string;
+  status?: "running" | "completed" | "failed";
+  steps: SubagentTraceStep[];
 }
 
 export interface SessionDetails extends SessionSummary {
   messages: Message[];
+  subagentTraces?: SubagentTrace[];
 }
 
 export interface Artifact {

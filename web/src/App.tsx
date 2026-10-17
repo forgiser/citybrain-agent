@@ -17,6 +17,7 @@ import type {
   RuntimeEnvelope,
   SessionDetails,
   SessionSummary,
+  SubagentTraceStep,
   TaskSnapshot,
 } from "./types";
 
@@ -30,7 +31,6 @@ export function App() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [mapLayers, setMapLayers] = useState<Artifact[]>([]);
   const [pendingMapLayers, setPendingMapLayers] = useState<PendingMapLayer[]>([]);
-  const [tasks, setTasks] = useState<TaskSnapshot[]>([]);
   const [interaction, setInteraction] = useState<InteractionRequest>();
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("sessions");
   const [settings, setSettings] = useState<WebSettings>();
@@ -88,9 +88,7 @@ export function App() {
     if (activate) await api(`/api/sessions/${sessionId}/activate`, { method: "POST" });
     const detail = await api<SessionDetails>(`/api/sessions/${sessionId}`);
     setCurrent(detail);
-    setMessages(detail.messages.filter((message) =>
-      message.role !== "assistant" || Boolean(message.content || message.thinking),
-    ));
+    setMessages(restoreMessages(detail));
     resetVisualizations();
     await Promise.all([refreshArtifacts(sessionId), refreshMapLayers(sessionId)]);
   }, [refreshArtifacts, refreshMapLayers, resetVisualizations]);
@@ -144,7 +142,6 @@ export function App() {
       setArtifacts([]);
       resetVisualizations();
     }
-    setTasks(await api<TaskSnapshot[]>("/api/tasks"));
     const pending = await api<InteractionRequest[]>("/api/interactions");
     setInteraction(pending[0]);
   }, [loadSession, resetVisualizations]);
@@ -225,7 +222,7 @@ export function App() {
       const result = await api<{ currentSession: SessionDetails | null }>(`/api/sessions/${sessionId}`, { method: "DELETE" });
       if (current?.id === sessionId) {
         setCurrent(result.currentSession ?? undefined);
-        setMessages(result.currentSession?.messages ?? []);
+        setMessages(result.currentSession ? restoreMessages(result.currentSession) : []);
         setArtifacts([]);
         resetVisualizations();
         if (result.currentSession) {
@@ -310,7 +307,6 @@ export function App() {
       setRunStatus(envelope.type === "run.completed" ? "completed" : "failed");
       if (current) {
         void refreshArtifacts(current.id);
-        void api<TaskSnapshot[]>("/api/tasks").then(setTasks);
         void api<SessionSummary[]>("/api/sessions").then(setSessions);
       }
     }
@@ -324,11 +320,11 @@ export function App() {
           : agentEvent.ok ? "completed" : "failed";
         setMessages((value) => upsertToolMessage(value, agentEvent, envelope.eventId, status));
         if (current) void refreshArtifacts(current.id);
+      } else if (agentEvent?.type === "subagent_event") {
+        setMessages((value) => appendSubagentEvent(value, agentEvent));
       }
     }
     if (envelope.type.startsWith("task.")) {
-      const task = envelope.data.task as TaskSnapshot | undefined;
-      if (task) setTasks((value) => [task, ...value.filter((item) => item.id !== task.id)]);
       if (current) void refreshArtifacts(current.id);
     }
     if (envelope.type === "interaction.created") {
@@ -367,7 +363,7 @@ export function App() {
   }
 
   if (settingsOpen && settings) {
-    return <SettingsPage settings={settings} options={settingsOptions} onChange={setSettings} onOptionsChange={setSettingsOptions} onBack={closeSettings} />;
+    return <SettingsPage settings={settings} options={settingsOptions} sessionId={current?.id} onChange={setSettings} onOptionsChange={setSettingsOptions} onBack={closeSettings} />;
   }
 
   return (
@@ -425,7 +421,6 @@ export function App() {
 
         <ChatPanel
           messages={messages}
-          tasks={tasks}
           interaction={interaction}
           available={Boolean(current)}
           running={runStatus === "running" || runStatus === "waiting_for_human" || runStatus === "queued"}
@@ -626,9 +621,8 @@ function ProjectExplorer({ session, onArtifact, onAddToMap, onOpenVisualization,
   </div>;
 }
 
-function ChatPanel({ messages, tasks, interaction, available, running, onSend, onCancel, onAnswer }: {
+function ChatPanel({ messages, interaction, available, running, onSend, onCancel, onAnswer }: {
   messages: Message[];
-  tasks: TaskSnapshot[];
   interaction?: InteractionRequest;
   available: boolean;
   running: boolean;
@@ -640,7 +634,7 @@ function ChatPanel({ messages, tasks, interaction, available, running, onSend, o
   const bottom = useRef<HTMLDivElement>(null);
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
-  }, [interaction, messages, tasks]);
+  }, [interaction, messages]);
   function submit() {
     if (!available || !input.trim() || running) return;
     const value = input;
@@ -651,24 +645,19 @@ function ChatPanel({ messages, tasks, interaction, available, running, onSend, o
     <div className="panel-heading"><div><h2>Agent 问答</h2></div><span className="online-dot">在线</span></div>
     <div className="chat-scroll">
       {messages.length === 0 && <div className="empty-chat"><div>◇</div><h3>{available ? "从空间问题开始" : "尚未进入会话"}</h3><p>{available ? "询问数据、运行 QGIS 分析，结果会直接出现在地图中。" : "请从左侧选择历史会话，或选择项目目录创建新会话。"}</p></div>}
-      {messages.map((message, index) => message.role === "tool" ? (
-        <ToolMessage message={message} key={message.id ?? `tool-${index}`} />
+      {groupChatMessages(messages).map((item, index) => item.kind === "tools" ? (
+        <ToolGroup messages={item.messages} key={`tools-${item.messages[0]?.id ?? index}`} />
       ) : (
-        <div className={`message ${message.role}`} key={`${index}-${message.id ?? "live"}`}>
-          <span className="message-label">{message.role === "user" ? "你" : "CityBrain"}</span>
-          {message.thinking && <details><summary>思考过程</summary><pre>{message.thinking}</pre></details>}
+        <div className={`message ${item.message.role}`} key={`${index}-${item.message.id ?? "live"}`}>
+          <span className="message-label">{item.message.role === "user" ? "你" : "CityBrain"}</span>
+          {item.message.thinking && <details><summary>思考过程</summary><pre>{item.message.thinking}</pre></details>}
           <div className="message-content">
-            {message.content
-              ? message.role === "assistant" ? <MarkdownContent>{message.content}</MarkdownContent> : message.content
-              : message.role === "assistant" ? <span className="typing">● ● ●</span> : ""}
+            {item.message.content
+              ? item.message.role === "assistant" ? <MarkdownContent>{item.message.content}</MarkdownContent> : item.message.content
+              : item.message.role === "assistant" ? <span className="typing">● ● ●</span> : ""}
           </div>
         </div>
       ))}
-      {tasks.filter((task) => !["completed", "failed", "cancelled", "timed_out"].includes(task.status)).map((task) => <div className="task-card" key={task.id}>
-        <div><strong>{task.description ?? task.name}</strong><span>{task.status}</span></div>
-        <div className="progress"><i style={{ width: `${task.progress?.percent ?? 20}%` }} /></div>
-        <small>{task.progress?.message ?? "后台处理中"}</small>
-      </div>)}
       {interaction && <HumanInteractionCard request={interaction} onAnswer={onAnswer} />}
       <div ref={bottom} />
     </div>
@@ -731,35 +720,60 @@ function interactionActionForOption(optionId: string): "approve" | "reject" | "s
   return "select";
 }
 
+function ToolGroup({ messages }: { messages: Message[] }) {
+  const running = messages.filter((item) => item.toolStatus === "running").length;
+  const failed = messages.filter((item) => item.toolStatus === "failed").length;
+  return <details className={`tool-log-group ${running ? "running" : failed ? "failed" : "completed"}`}>
+    <summary className="tool-log-group-heading">
+      <span className="tool-log-command-icon" aria-hidden="true">›_</span>
+      <span>{running ? "正在使用工具" : "已使用工具"}</span>
+      <span className="tool-log-count">{messages.length} 项</span>
+      {failed > 0 && <span className="tool-log-group-error">{failed} 项失败</span>}
+      <span className="tool-log-chevron" aria-hidden="true" />
+    </summary>
+    <div className="tool-log-lines">{messages.map((message, index) => <ToolMessage message={message} key={message.id ?? index} />)}</div>
+  </details>;
+}
+
 function ToolMessage({ message }: { message: Message }) {
   const status = message.toolStatus ?? "completed";
   const statusLabel = {
-    running: "执行中",
-    completed: "已完成",
-    failed: "执行失败",
-    background: "已转入后台",
+    running: "正在运行",
+    completed: "已运行",
+    failed: "运行失败",
+    background: "后台运行",
   }[status];
-  const hasDetails = Boolean(message.toolArguments || message.content);
-
   return (
-    <div className={`tool-message ${status}`}>
-      <div className="tool-message-heading">
-        <span className="tool-icon" aria-hidden="true">{status === "running" ? "◌" : status === "failed" ? "!" : "✓"}</span>
-        <div>
-          <strong>{message.toolName ?? "工具调用"}</strong>
-          {message.toolSummary && <small>{message.toolSummary}</small>}
-        </div>
-        <span className="tool-status">{statusLabel}</span>
+    <details className={`tool-log-item ${status}`}>
+      <summary className="tool-log-item-heading" title={[message.toolName, message.toolSummary].filter(Boolean).join(" · ")}>
+        <span className="tool-log-command-icon" aria-hidden="true">›_</span>
+        <span className="tool-log-state">{statusLabel}</span>
+        <code className="tool-log-name">{message.toolName ?? "工具调用"}</code>
+        {message.toolSummary && <span className="tool-log-summary">{message.toolSummary}</span>}
+        <span className="tool-log-chevron" aria-hidden="true" />
+      </summary>
+      <div className="tool-log-detail">
+        {message.toolArguments && <div className="tool-log-io input"><label>输入</label><pre>{formatToolArguments(message.toolArguments)}</pre></div>}
+        {message.subagentTrace && <SubagentTraceView trace={message.subagentTrace} />}
+        {message.content && <div className="tool-log-io output"><label>输出</label><pre>{message.content}</pre></div>}
+        {!message.toolArguments && !message.content && !message.subagentTrace && <span>执行中…</span>}
       </div>
-      {hasDetails && (
-        <details>
-          <summary>查看执行详情</summary>
-          {message.toolArguments && <><label>参数</label><pre>{formatToolArguments(message.toolArguments)}</pre></>}
-          {message.content && <><label>结果</label><pre>{message.content}</pre></>}
-        </details>
-      )}
-    </div>
+    </details>
   );
+}
+
+function SubagentTraceView({ trace }: { trace: NonNullable<Message["subagentTrace"]> }) {
+  return <div className="tool-log-subagent">
+    <div className="tool-log-subagent-heading"><span>子智能体 · {trace.subagentType}</span><span>{trace.status === "running" ? "运行中" : trace.status === "failed" ? "失败" : "已完成"}</span></div>
+    {groupSubagentSteps(trace.steps).map((item, index) => item.kind === "tool" ? (
+      <ToolMessage key={item.message.id ?? index} message={item.message} />
+    ) : item.kind === "thinking" ? (
+      <details className="tool-log-thinking" key={index}><summary>思考过程</summary><pre>{item.content}</pre></details>
+    ) : (
+      <div className="tool-log-subagent-text message-content" key={index}><MarkdownContent>{item.content}</MarkdownContent></div>
+    ))}
+    {trace.steps.length === 0 && <span className="tool-log-empty">等待子智能体响应…</span>}
+  </div>;
 }
 
 function ModalFrame({ children, className = "app-dialog", onClose }: {
@@ -882,6 +896,102 @@ function DirectoryPickerDialog({ recentPaths, onCancel, onSelect }: {
   </ModalFrame>;
 }
 
+function restoreMessages(detail: SessionDetails): Message[] {
+  const traces = new Map((detail.subagentTraces ?? []).map((trace) => [trace.parentToolCallId, trace]));
+  return detail.messages
+    .filter((message) => message.role !== "assistant" || Boolean(message.content || message.thinking))
+    .map((message) => message.role === "tool" && message.toolCallId && traces.has(message.toolCallId)
+      ? { ...message, subagentTrace: traces.get(message.toolCallId) }
+      : message);
+}
+
+type ChatItem = { kind: "tools"; messages: Message[] } | { kind: "message"; message: Message };
+
+function groupChatMessages(messages: Message[]): ChatItem[] {
+  const groups: ChatItem[] = [];
+  for (const message of messages) {
+    const last = groups.at(-1);
+    if (message.role === "tool") {
+      if (last?.kind === "tools") last.messages.push(message);
+      else groups.push({ kind: "tools", messages: [message] });
+    } else {
+      groups.push({ kind: "message", message });
+    }
+  }
+  return groups;
+}
+
+type SubagentItem = { kind: "tool"; message: Message } | { kind: "text" | "thinking"; content: string };
+
+function groupSubagentSteps(steps: SubagentTraceStep[]): SubagentItem[] {
+  const items: SubagentItem[] = [];
+  for (const step of steps) {
+    if (step.type === "text" || step.type === "thinking") {
+      const last = items.at(-1);
+      if (last?.kind === step.type) last.content += step.delta ?? "";
+      else items.push({ kind: step.type, content: step.delta ?? "" });
+      continue;
+    }
+    const id = step.toolCallId ?? `${step.name ?? "tool"}-${items.length}`;
+    const existing = items.find((item) => item.kind === "tool" && item.message.toolCallId === id);
+    const next: Message = {
+      ...(existing?.kind === "tool" ? existing.message : {}),
+      id: `child-tool-${id}`,
+      role: "tool",
+      toolCallId: id,
+      toolName: step.name ?? (existing?.kind === "tool" ? existing.message.toolName : undefined),
+      toolStatus: step.type === "tool_started" ? "running" : step.ok ? "completed" : "failed",
+      toolSummary: step.toolUseSummary ?? step.activityDescription ?? (existing?.kind === "tool" ? existing.message.toolSummary : undefined),
+      toolArguments: step.argumentsText ?? (existing?.kind === "tool" ? existing.message.toolArguments : undefined),
+      content: step.result ?? (existing?.kind === "tool" ? existing.message.content : ""),
+    };
+    if (existing?.kind === "tool") existing.message = next;
+    else items.push({ kind: "tool", message: next });
+  }
+  return items;
+}
+
+function appendSubagentEvent(messages: Message[], event: Record<string, unknown>): Message[] {
+  const parentToolCallId = readEventString(event.parentToolCallId);
+  const step = event.event;
+  if (!parentToolCallId || !step || typeof step !== "object" || Array.isArray(step)) return messages;
+  const traceStep = step as SubagentTraceStep;
+  if (!["text", "thinking", "tool_started", "tool_result"].includes(traceStep.type)) return messages;
+  const id = `tool-${parentToolCallId}`;
+  const index = messages.findIndex((message) => message.role === "tool" && (message.id === id || message.toolCallId === parentToolCallId));
+  if (index < 0) return messages;
+  const next = [...messages];
+  const message = next[index]!;
+  const subagentType = subagentTypeFromArguments(message.toolArguments);
+  const steps = [...(message.subagentTrace?.steps ?? [])];
+  const previous = steps.at(-1);
+  if (traceStep.delta && previous?.type === traceStep.type && previous.delta !== undefined) {
+    steps[steps.length - 1] = { ...previous, delta: `${previous.delta}${traceStep.delta}`.slice(-12_000) };
+  } else {
+    steps.push(traceStep);
+  }
+  next[index] = {
+    ...message,
+    subagentTrace: {
+      parentToolCallId,
+      subagentType,
+      label: message.toolSummary ?? subagentType,
+      status: "running",
+      steps: steps.slice(-160),
+    },
+  };
+  return next;
+}
+
+function subagentTypeFromArguments(argumentsText?: string): string {
+  try {
+    const parsed = JSON.parse(argumentsText ?? "{}");
+    return typeof parsed.subagent_type === "string" ? parsed.subagent_type : "子智能体";
+  } catch {
+    return "子智能体";
+  }
+}
+
 function appendAssistant(messages: Message[], field: "content" | "thinking", delta: string): Message[] {
   const next = [...messages];
   const last = next.at(-1);
@@ -903,18 +1013,29 @@ function upsertToolMessage(
   const id = `tool-${toolCallId}`;
   const existingIndex = messages.findIndex((message) => message.role === "tool" && message.id === id);
   const existing = existingIndex >= 0 ? messages[existingIndex] : undefined;
+  const toolName = readEventString(event.name) ?? existing?.toolName ?? "tool";
+  const toolArguments = readEventString(event.argumentsText) ?? existing?.toolArguments;
+  const subagentTrace = existing?.subagentTrace ?? (toolName === "delegate" ? {
+    parentToolCallId: toolCallId,
+    subagentType: subagentTypeFromArguments(toolArguments),
+    label: readEventString(event.toolUseSummary) ?? "子智能体",
+    steps: [],
+  } : undefined);
   const nextMessage: Message = {
     ...existing,
     id,
     role: "tool",
     toolCallId,
-    toolName: readEventString(event.name) ?? existing?.toolName ?? "tool",
+    toolName,
     toolStatus: status,
     toolSummary: readEventString(event.toolUseSummary)
       ?? readEventString(event.activityDescription)
       ?? existing?.toolSummary,
-    toolArguments: readEventString(event.argumentsText) ?? existing?.toolArguments,
+    toolArguments,
     content: readEventString(event.result) ?? existing?.content ?? "",
+    subagentTrace: subagentTrace
+      ? { ...subagentTrace, status: status === "running" ? "running" : status === "failed" ? "failed" : "completed" }
+      : undefined,
   };
 
   if (existingIndex < 0) {

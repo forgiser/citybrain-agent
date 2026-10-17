@@ -24,6 +24,8 @@ export interface QgisTool {
 export type RuntimeGetter = () => QgisRuntimeInfo | undefined;
 
 const RUN_TIMEOUT_RANGE: [number, number] = [5_000, QGIS_EXECUTE_TIMEOUT_MS];
+/** Keep long QGIS calls in the foreground for one minute before ownership transfer. */
+export const QGIS_BACKGROUND_AFTER_MS = 60_000;
 const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/u;
 
 export function makeRunQgisAlgorithmTool(getRuntime: RuntimeGetter): QgisTool {
@@ -164,7 +166,7 @@ export function makeRunQgisAlgorithmTool(getRuntime: RuntimeGetter): QgisTool {
       isConcurrencySafe: isQgisAlgorithmConcurrencySafe,
       interruptBehavior: "cancel",
       supportsBackground: true,
-      backgroundAfterMs: 35_000,
+      backgroundAfterMs: QGIS_BACKGROUND_AFTER_MS,
       getPath: getQgisInputPaths,
       getReadPaths: getQgisInputPaths,
       getWritePaths: getQgisOutputParameterPaths,

@@ -24,22 +24,34 @@ export interface SettingsOptions {
   providers: SettingsProvider[];
 }
 
-type SettingsSection = "models" | "agent" | "qgis" | "map" | "appearance" | "tools" | "tasks" | "security";
+type SettingsSection = "models" | "agent" | "qgis" | "map" | "appearance" | "observability" | "workflows" | "eval" | "tools" | "tasks" | "security";
 
-const MENU: Array<{ id: SettingsSection; label: string; description: string; planned?: boolean }> = [
-  { id: "models", label: "模型服务", description: "服务商、API 与默认模型" },
-  { id: "agent", label: "Agent", description: "推理与回答行为" },
-  { id: "qgis", label: "QGIS", description: "空间处理运行环境" },
-  { id: "map", label: "地图", description: "底图与图层行为" },
-  { id: "appearance", label: "界面", description: "主题与显示偏好" },
-  { id: "tools", label: "工具与 MCP", description: "工具来源和启用策略", planned: true },
-  { id: "tasks", label: "后台任务", description: "并发、超时与通知", planned: true },
-  { id: "security", label: "权限与安全", description: "沙箱和操作确认", planned: true },
+const MENU: Array<{ title: string; items: Array<{ id: SettingsSection; label: string; description: string; planned?: boolean }> }> = [
+  { title: "通用设置", items: [
+    { id: "models", label: "模型服务", description: "服务商、API 与默认模型" },
+    { id: "agent", label: "Agent 行为", description: "推理与回答行为" },
+    { id: "appearance", label: "界面外观", description: "主题与显示偏好" },
+  ] },
+  { title: "空间能力", items: [
+    { id: "qgis", label: "QGIS 环境", description: "空间处理运行环境" },
+    { id: "map", label: "地图配置", description: "底图与图层行为" },
+  ] },
+  { title: "运行与评估", items: [
+    { id: "workflows", label: "工作流", description: "提取、编辑与复跑分析" },
+    { id: "eval", label: "评测", description: "基准用例与 Run 评估" },
+    { id: "observability", label: "可观测性", description: "链路、Token 与错误" },
+    { id: "tasks", label: "后台任务", description: "历史、恢复与产物" },
+  ] },
+  { title: "扩展与安全", items: [
+    { id: "tools", label: "工具与 MCP", description: "工具启用策略", planned: true },
+    { id: "security", label: "权限与安全", description: "沙箱和操作确认", planned: true },
+  ] },
 ];
 
-export function SettingsPage({ settings, options: initialOptions, onChange, onOptionsChange, onBack }: {
+export function SettingsPage({ settings, options: initialOptions, sessionId, onChange, onOptionsChange, onBack }: {
   settings: WebSettings;
   options: SettingsOptions;
+  sessionId?: string;
   onChange: (value: WebSettings) => void;
   onOptionsChange: (value: SettingsOptions) => void;
   onBack: () => void;
@@ -71,14 +83,14 @@ export function SettingsPage({ settings, options: initialOptions, onChange, onOp
   return <div className="settings-page settings-center">
     <header>
       <button onClick={onBack}>← 返回工作区</button>
-      <button className="save" onClick={() => void save()}>{saved ? "已保存" : "保存设置"}</button>
+      {(["models", "agent", "qgis", "map", "appearance"] as SettingsSection[]).includes(section) && <button className="save" onClick={() => void save()}>{saved ? "已保存" : "保存设置"}</button>}
     </header>
     <div className="settings-layout">
       <nav className="settings-menu" aria-label="设置分类">
-        {MENU.map((item) => <button className={section === item.id ? "active" : ""} key={item.id} onClick={() => setSection(item.id)}>
+        {MENU.map((group) => <div className="settings-menu-group" key={group.title}><h3>{group.title}</h3>{group.items.map((item) => <button className={section === item.id ? "active" : ""} key={item.id} onClick={() => setSection(item.id)}>
           <span><strong>{item.label}</strong>{item.planned && <em>待集成</em>}</span>
           <small>{item.description}</small>
-        </button>)}
+        </button>)}</div>)}
       </nav>
       <main className="settings-content">
         {notice && <div className={`settings-notice ${notice.kind}`} onClick={() => setNotice(undefined)}>{notice.text}</div>}
@@ -111,11 +123,120 @@ export function SettingsPage({ settings, options: initialOptions, onChange, onOp
             <select value={draft.theme} onChange={(event) => setDraft({ ...draft, theme: event.target.value as WebSettings["theme"] })}><option value="dark">深色</option><option value="light">浅色</option></select>
           </SettingField>
         </SettingsModule>}
-        {(["tools", "tasks", "security"] as SettingsSection[]).includes(section) && <PlannedSettings section={section} />}
+        {section === "observability" && <ObservabilityPanel sessionId={sessionId} />}
+        {section === "workflows" && <WorkflowPanel sessionId={sessionId} />}
+        {section === "eval" && <EvalPanel sessionId={sessionId} />}
+        {section === "tasks" && <TaskHistoryPanel sessionId={sessionId} />}
+        {(["tools", "security"] as SettingsSection[]).includes(section) && <PlannedSettings section={section} />}
       </main>
     </div>
   </div>;
 }
+
+interface ObservationReport {
+  generatedAt: string;
+  workspaceDir: string;
+  summary: {
+    runs: number; modelRequests: number; toolCalls: number; toolSuccessRate: number;
+    errors: number; hitlRequests: number; artifacts: number; activeTasks: number;
+    totalTokens: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number;
+    contextCompactions: number; peakContextPercent: number;
+    averageModelLatencyMs: number; averageToolDurationMs: number; p95ToolDurationMs: number;
+  };
+  runs: Array<{ runId: string; startedAt?: string; status: string; turns: number; modelRequests: number; toolCalls: number; errors: number; totalTokens: number; durationMs?: number }>;
+  tools: Array<{ name: string; calls: number; succeeded: number; failed: number; averageDurationMs: number; p95DurationMs: number; lastExecutedAt?: string }>;
+  activeTasks: Array<{ id: string; name: string; status: string; runId?: string; detached: boolean; progress?: number; elapsedMs?: number }>;
+  timeline: Array<{ id: string; timestamp: string; kind: string; title: string; status?: string; runId?: string; taskId?: string; tool?: string; durationMs?: number; detail?: string }>;
+  logFiles: Array<{ name: string; path: string; size: number; loadedBytes: number; truncated: boolean; exists: boolean }>;
+}
+
+function ObservabilityPanel({ sessionId }: { sessionId?: string }) {
+  const [report, setReport] = useState<ObservationReport>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [live, setLive] = useState(true);
+  const [kind, setKind] = useState("all");
+  const [runId, setRunId] = useState("");
+
+  async function refresh() {
+    if (!sessionId) {
+      setReport(undefined);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const query = new URLSearchParams({ limit: "300" });
+      if (runId) query.set("runId", runId);
+      setReport(await api<ObservationReport>(`/api/sessions/${encodeURIComponent(sessionId)}/observability?${query}`));
+      setError(undefined);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void refresh(); }, [runId, sessionId]);
+  useEffect(() => {
+    if (!live) return;
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [live, runId, sessionId]);
+
+  const timeline = report?.timeline.filter((item) => kind === "all" || item.kind === kind) ?? [];
+  const metric = (label: string, value: string | number, hint: string) => <div className="observe-metric"><small>{label}</small><strong>{value}</strong><span>{hint}</span></div>;
+
+  return <SettingsModule eyebrow="AGENT OBSERVABILITY" title="全链路观测" description="从模型请求、上下文、工具、后台任务、HITL、产物和错误多个维度观察当前工作区中的 Agent 运行。完整 Trace 保存在工作区内部日志中，页面只展示聚合指标和安全预览。">
+    {!sessionId && <div className="observe-empty">请先创建或选择一个会话，再查看其工作区的 Agent 观测数据。</div>}
+    {sessionId && <>
+    <div className="observe-toolbar">
+      <button onClick={() => void refresh()} disabled={loading}>{loading ? "刷新中…" : "立即刷新"}</button>
+      <label><input type="checkbox" checked={live} onChange={(event) => setLive(event.target.checked)} /> 每 5 秒刷新</label>
+      <select value={runId} onChange={(event) => setRunId(event.target.value)}><option value="">全部 Run</option>{report?.runs.map((run) => <option key={run.runId} value={run.runId}>{run.runId.slice(0, 18)} · {run.status}</option>)}</select>
+    </div>
+    {error && <div className="observe-error">{error}</div>}
+    {report && <>
+      <div className="observe-meta"><span>工作区：{report.workspaceDir}</span><span>生成时间：{formatDate(report.generatedAt)}</span></div>
+      <div className="observe-metrics">
+        {metric("RUNS", report.summary.runs, `${report.summary.modelRequests} 次模型请求`)}
+        {metric("TOOLS", report.summary.toolCalls, `${report.summary.toolSuccessRate.toFixed(1)}% 成功率`)}
+        {metric("TOKENS", compactNumber(report.summary.totalTokens), `输入 ${compactNumber(report.summary.inputTokens)} / 输出 ${compactNumber(report.summary.outputTokens)} / 缓存 ${compactNumber(report.summary.cacheReadTokens)}`)}
+        {metric("MODEL LATENCY", formatDuration(report.summary.averageModelLatencyMs), "平均响应耗时")}
+        {metric("TOOL P95", formatDuration(report.summary.p95ToolDurationMs), `平均 ${formatDuration(report.summary.averageToolDurationMs)}`)}
+        {metric("ERRORS", report.summary.errors, `${report.summary.hitlRequests} 次 HITL`)}
+        {metric("CONTEXT", `${report.summary.peakContextPercent.toFixed(1)}%`, `${report.summary.contextCompactions} 次压缩`)}
+        {metric("ARTIFACTS", report.summary.artifacts, "已登记产物")}
+        {metric("ACTIVE TASKS", report.summary.activeTasks, "当前运行或排队")}
+      </div>
+      {report.activeTasks.length > 0 && <ObserveSection title="活动后台任务">
+        <div className="observe-task-list">{report.activeTasks.map((task) => <div key={task.id}><span className="observe-status running">{task.status}</span><strong>{task.name}</strong><small>{task.detached ? "后台执行" : "前台托管"}{task.progress !== undefined ? ` · ${task.progress}%` : ""}</small></div>)}</div>
+      </ObserveSection>}
+      <div className="observe-columns">
+        <ObserveSection title="最近运行">
+          {report.runs.length > 0 ? <div className="observe-table"><div className="head"><span>Run</span><span>状态</span><span>模型/工具</span><span>耗时</span></div>{report.runs.slice(0, 12).map((run) => <div key={run.runId}><code title={run.runId}>{run.runId.slice(0, 12)}</code><span className={`observe-status ${run.status}`}>{run.status}</span><span>{run.modelRequests} / {run.toolCalls}</span><span>{formatDuration(run.durationMs ?? 0)}</span></div>)}</div> : <div className="observe-empty">当前工作区还没有运行记录</div>}
+        </ObserveSection>
+        <ObserveSection title="工具统计">
+          {report.tools.length > 0 ? <div className="observe-table tools"><div className="head"><span>工具</span><span>调用</span><span>成功</span><span>P95</span></div>{report.tools.slice(0, 12).map((tool) => <div key={tool.name}><code title={tool.name}>{tool.name}</code><span>{tool.calls}</span><span>{tool.succeeded}/{tool.calls}</span><span>{formatDuration(tool.p95DurationMs)}</span></div>)}</div> : <div className="observe-empty">当前工作区还没有工具调用</div>}
+        </ObserveSection>
+      </div>
+      <ObserveSection title="链路时间线" actions={<select value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">全部事件</option>{["run", "model", "tool", "task", "hitl", "artifact", "error", "context"].map((value) => <option key={value} value={value}>{value}</option>)}</select>}>
+        {timeline.length > 0 ? <div className="observe-timeline">{timeline.slice(0, 100).map((item) => <article key={item.id}><i className={item.kind} /><time>{formatDate(item.timestamp)}</time><div><strong>{item.title}</strong><small>{[item.kind, item.status, item.durationMs !== undefined ? formatDuration(item.durationMs) : undefined].filter(Boolean).join(" · ")}</small>{item.detail && <p>{item.detail}</p>}</div></article>)}</div> : <div className="observe-empty">当前筛选条件下没有事件</div>}
+      </ObserveSection>
+      <ObserveSection title="日志来源"><div className="observe-log-files">{report.logFiles.map((file) => <div key={file.name}><strong>{file.name}</strong><code>{file.path}</code><span>{file.truncated ? `已读取 ${formatBytes(file.loadedBytes)} / ${formatBytes(file.size)}` : formatBytes(file.size)}</span></div>)}</div></ObserveSection>
+    </>}
+    </>}
+  </SettingsModule>;
+}
+
+function ObserveSection({ title, actions, children }: { title: string; actions?: ReactNode; children: ReactNode }) {
+  return <section className="observe-section"><header><h3>{title}</h3>{actions}</header>{children}</section>;
+}
+
+function formatDuration(value: number): string { return value < 1_000 ? `${Math.round(value)}ms` : value < 60_000 ? `${(value / 1_000).toFixed(1)}s` : `${(value / 60_000).toFixed(1)}min`; }
+function compactNumber(value: number): string { return Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(value); }
+function formatDate(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false }); }
+function formatBytes(value: number): string { return value < 1024 ? `${value} B` : value < 1024 ** 2 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 ** 2).toFixed(1)} MB`; }
 
 function ModelSettingsPanel({ draft, options, onDraft, onOptions, onSettings, onNotice }: {
   draft: WebSettings;
@@ -289,6 +410,175 @@ function QgisFilePicker({ initialPath, busy, onCancel, onApply }: {
       <div className="dialog-actions"><button className="secondary" disabled={busy} onClick={onCancel}>取消</button><button className="primary" disabled={!selectedFile || busy} onClick={() => void onApply(selectedFile)}>{busy ? "验证应用中…" : "选择并应用"}</button></div>
     </div>
   </div>;
+}
+
+interface WorkflowView {
+  id: string; name: string; sourceRunId?: string; createdAt: string;
+  nodes: Array<{ id: string; tool: string; arguments: Record<string, unknown>; dependencies: string[]; inputPaths: string[]; outputPaths: string[] }>;
+}
+
+interface HistoricalTaskView {
+  id: string; name: string; status: string; attempt?: number; updatedAt: string;
+  progress?: { phase: string; message?: string; percent?: number };
+  error?: { code?: string; message: string };
+  artifactPaths: string[];
+  metadata?: Record<string, unknown>;
+}
+
+interface EvalCaseView { id: string; name: string; prompt: string; tags?: string[]; expected: Record<string, unknown> }
+interface EvalReportView {
+  model: string;
+  summary: { total: number; passed: number; successRate: number; averageToolCalls: number; averageTokens: number; p95DurationMs: number };
+  cases: Array<{ caseId: string; runId: string; passed: boolean; checks: Array<{ name: string; passed: boolean; detail: string }>; metrics: { toolCalls: number; totalTokens: number; durationMs: number } }>;
+}
+
+function EvalPanel({ sessionId }: { sessionId?: string }) {
+  const [cases, setCases] = useState<EvalCaseView[]>([]);
+  const [runOptions, setRunOptions] = useState<Array<{ runId: string; status: string }>>([]);
+  const [caseId, setCaseId] = useState("");
+  const [runId, setRunId] = useState("");
+  const [result, setResult] = useState<{ report: EvalReportView; markdown: string }>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setResult(undefined); setError("");
+    if (!sessionId) { setRunOptions([]); return; }
+    void Promise.all([
+      api<EvalCaseView[]>("/api/evals/cases"),
+      api<ObservationReport>(`/api/sessions/${encodeURIComponent(sessionId)}/observability?limit=100`),
+    ]).then(([nextCases, observation]) => {
+      setCases(nextCases);
+      setCaseId((current) => current || nextCases[0]?.id || "");
+      setRunOptions(observation.runs);
+      setRunId((current) => current || observation.runs[0]?.runId || "");
+    }).catch((cause) => setError(errorMessage(cause)));
+  }, [sessionId]);
+
+  async function evaluate() {
+    if (!sessionId || !caseId || !runId.trim()) return;
+    setBusy(true);
+    try {
+      setResult(await api<{ report: EvalReportView; markdown: string }>(`/api/sessions/${encodeURIComponent(sessionId)}/evals`, {
+        method: "POST", body: JSON.stringify({ caseId, runId: runId.trim() }),
+      }));
+      setError("");
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  function download(content: string, extension: "json" | "md") {
+    const url = URL.createObjectURL(new Blob([content], { type: extension === "json" ? "application/json" : "text/markdown" }));
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = `citybrain-eval-${caseId}-${runId.slice(0, 8)}.${extension}`; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  const selected = cases.find((item) => item.id === caseId);
+  const evaluated = result?.report.cases[0];
+  return <SettingsModule eyebrow="AGENT EVALUATION" title="评测" description="用内置 GIS 基准用例检查当前工作区中已完成的 Agent Run。结果来自真实工具日志和产物，不会重新调用模型。完整基准批量执行可使用 CLI。">
+    {!sessionId ? <div className="observe-empty">请先创建或选择会话，再评测该工作区的 Run。</div> : <>
+      <div className="eval-controls"><label>基准用例<select value={caseId} onChange={(event) => { setCaseId(event.target.value); setResult(undefined); }}>{cases.map((item) => <option key={item.id} value={item.id}>{item.id} · {item.name}</option>)}</select></label><label>Agent Run ID<input list="eval-run-options" value={runId} onChange={(event) => setRunId(event.target.value)} placeholder="选择或输入 Run ID" /><datalist id="eval-run-options">{runOptions.map((item) => <option key={item.runId} value={item.runId}>{item.status}</option>)}</datalist></label><button disabled={busy || !caseId || !runId.trim()} onClick={() => void evaluate()}>{busy ? "评测中…" : "评测 Run"}</button></div>
+      {selected && <div className="eval-case-description"><strong>{selected.name}</strong><p>{selected.prompt}</p><small>{selected.tags?.join(" · ")}</small></div>}
+      {error && <div className="observe-error">{error}</div>}
+      {evaluated && result && <><div className={`eval-result ${evaluated.passed ? "passed" : "failed"}`}><div><strong>{evaluated.passed ? "通过" : "未通过"}</strong><span>{evaluated.caseId} · {result.report.model}</span></div><div><span>工具 {evaluated.metrics.toolCalls}</span><span>Token {evaluated.metrics.totalTokens}</span><span>耗时 {formatDuration(evaluated.metrics.durationMs)}</span></div></div><div className="eval-checks">{evaluated.checks.map((check) => <div key={check.name}><span className={`observe-status ${check.passed ? "completed" : "failed"}`}>{check.passed ? "通过" : "失败"}</span><strong>{check.name}</strong><small>{check.detail}</small></div>)}</div><div className="eval-downloads"><button onClick={() => download(JSON.stringify(result.report, null, 2), "json")}>下载 JSON</button><button onClick={() => download(result.markdown, "md")}>下载 Markdown</button></div></>}
+    </>}
+  </SettingsModule>;
+}
+
+function TaskHistoryPanel({ sessionId }: { sessionId?: string }) {
+  const [tasks, setTasks] = useState<HistoricalTaskView[]>([]);
+  const [error, setError] = useState("");
+  async function refresh() {
+    if (!sessionId) { setTasks([]); return; }
+    try { setTasks(await api<HistoricalTaskView[]>("/api/tasks")); setError(""); }
+    catch (cause) { setError(errorMessage(cause)); }
+  }
+  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 5_000); return () => window.clearInterval(timer); }, [sessionId]);
+  return <SettingsModule eyebrow="DURABLE TASKS" title="后台任务" description="显示当前工作区的持久化任务。进程异常后，不能安全重放的任务标为 orphaned；可恢复的工作流会从已完成节点继续。">
+    {!sessionId ? <div className="observe-empty">请先创建或选择会话。</div> : <><div className="observe-toolbar"><button onClick={() => void refresh()}>刷新</button></div>{error && <div className="observe-error">{error}</div>}{tasks.length === 0 && <div className="observe-empty">暂无任务记录。</div>}<div className="task-history-list">{tasks.map((task) => <article key={task.id}><div><strong>{task.name}</strong><span className={`observe-status ${task.status}`}>{task.status}</span></div><small>ID {task.id} · 尝试 {task.attempt ?? 1} · {formatDate(task.updatedAt)}</small>{task.progress && <small>{task.progress.phase} · {task.progress.message ?? ""}{task.progress.percent !== undefined ? ` · ${task.progress.percent}%` : ""}</small>}{task.error && <p className="observe-error">{task.error.code ? `${task.error.code}: ` : ""}{task.error.message}</p>}{typeof task.metadata?.recoveryReason === "string" && <small>恢复原因：{task.metadata.recoveryReason}</small>}{task.artifactPaths.length > 0 && <small>产物：{task.artifactPaths.join("、")}</small>}</article>)}</div></>}
+  </SettingsModule>;
+}
+interface WorkflowExecutionView { status: string; updatedAt: string; nodes: Record<string, { status: string; attempt: number; error?: string }> }
+
+function WorkflowPanel({ sessionId }: { sessionId?: string }) {
+  const [items, setItems] = useState<WorkflowView[]>([]);
+  const [selected, setSelected] = useState("");
+  const [detail, setDetail] = useState<{ definition: WorkflowView; execution?: WorkflowExecutionView }>();
+  const [runId, setRunId] = useState("");
+  const [name, setName] = useState("");
+  const [editing, setEditing] = useState("");
+  const [args, setArgs] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [taskStatus, setTaskStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const base = sessionId ? `/api/sessions/${encodeURIComponent(sessionId)}/workflows` : "";
+
+  async function refresh() {
+    if (!base) { setItems([]); setDetail(undefined); return; }
+    try {
+      const next = await api<WorkflowView[]>(base);
+      setItems(next);
+      if (selected) setDetail(await api<{ definition: WorkflowView; execution?: WorkflowExecutionView }>(`${base}/${encodeURIComponent(selected)}`));
+      if (taskId) {
+        const task = await api<{ status: string }>(`/api/tasks/${encodeURIComponent(taskId)}`);
+        setTaskStatus(task.status);
+      }
+      setError("");
+    } catch (cause) { setError(errorMessage(cause)); }
+  }
+
+  useEffect(() => { setSelected(""); setDetail(undefined); setTaskId(""); void refresh(); }, [sessionId]);
+  useEffect(() => { void refresh(); }, [selected]);
+  useEffect(() => {
+    if (!sessionId) return;
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [sessionId, selected, taskId]);
+
+  async function create() {
+    if (!runId.trim()) return;
+    setBusy(true);
+    try {
+      const created = await api<WorkflowView>(base, { method: "POST", body: JSON.stringify({ runId: runId.trim(), name: name.trim() || undefined }) });
+      setSelected(created.id); setRunId(""); setName(""); await refresh();
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  async function saveNode(nodeId: string) {
+    setBusy(true);
+    try {
+      const parsed: unknown = JSON.parse(args);
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("参数必须是 JSON 对象");
+      await api(`${base}/${encodeURIComponent(selected)}/nodes/${encodeURIComponent(nodeId)}`, { method: "PATCH", body: JSON.stringify(parsed) });
+      setEditing(""); await refresh();
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  async function start() {
+    setBusy(true);
+    try {
+      const task = await api<{ id: string; status: string }>(`${base}/${encodeURIComponent(selected)}/runs`, { method: "POST" });
+      setTaskId(task.id); setTaskStatus(task.status); await refresh();
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(false); }
+  }
+
+  return <SettingsModule eyebrow="REPRODUCIBLE WORKFLOW" title="空间分析工作流" description="从已完成的 Agent Run 提取可重放的 QGIS 处理链；确认节点参数后，可在后台按依赖顺序执行并复用未变化的结果。">
+    {!sessionId && <div className="observe-empty">请先创建或选择会话。</div>}
+    {sessionId && <>
+      <div className="workflow-create"><input aria-label="Agent Run ID" placeholder="Agent Run ID" value={runId} onChange={(event) => setRunId(event.target.value)} /><input aria-label="工作流名称" placeholder="工作流名称（可选）" value={name} onChange={(event) => setName(event.target.value)} /><button disabled={busy || !runId.trim()} onClick={() => void create()}>从 Run 提取</button></div>
+      {error && <div className="observe-error">{error}</div>}
+      <div className="workflow-layout"><div className="workflow-list">{items.length === 0 && <p>暂无工作流。可从可观测性页面复制 Run ID。</p>}{items.map((item) => <button className={selected === item.id ? "active" : ""} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.name}</strong><small>{item.nodes.length} 个节点 · {item.sourceRunId?.slice(0, 12) ?? "手工创建"}</small></button>)}</div>
+      <div className="workflow-detail">{detail ? <><div className="workflow-heading"><div><h3>{detail.definition.name}</h3><small>{detail.execution ? `最近执行：${detail.execution.status} · ${formatDate(detail.execution.updatedAt)}` : "尚未执行"}{taskStatus ? ` · 后台任务：${taskStatus}` : ""}</small></div><button disabled={busy} onClick={() => void start()}>运行工作流</button></div>
+        {detail.definition.nodes.map((node) => <article className="workflow-node" key={node.id}><div><strong>{node.id} · {node.tool}</strong><span className={`observe-status ${detail.execution?.nodes[node.id]?.status ?? "queued"}`}>{detail.execution?.nodes[node.id]?.status ?? "未执行"}</span></div><small>依赖：{node.dependencies.join(", ") || "无"}</small><small>输入：{node.inputPaths.join(", ") || "无"}</small><small>输出：{node.outputPaths.join(", ") || "无"}</small>{detail.execution?.nodes[node.id]?.error && <p className="observe-error">{detail.execution.nodes[node.id].error}</p>}
+          {editing === node.id ? <><textarea aria-label={`${node.id} 参数`} value={args} onChange={(event) => setArgs(event.target.value)} /><div className="workflow-actions"><button disabled={busy} onClick={() => void saveNode(node.id)}>保存参数</button><button onClick={() => setEditing("")}>取消</button></div></> : <><pre>{JSON.stringify(node.arguments, null, 2)}</pre><button onClick={() => { setEditing(node.id); setArgs(JSON.stringify(node.arguments, null, 2)); }}>编辑参数</button></>}</article>)}
+      </> : <div className="observe-empty">选择工作流查看节点、依赖与执行状态。</div>}</div></div>
+    </>}
+  </SettingsModule>;
 }
 
 function SettingsModule({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children: ReactNode }) {

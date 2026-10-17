@@ -86,10 +86,16 @@ import {
 import { findShellCommand, shellCommands } from "./shell-commands.js";
 import { CliHumanInteractionAdapter } from "./cli-human-interaction.js";
 import {
-  formatTaskCompletionNotification,
   isTaskTerminal,
   isToolExecutionTask,
+  type TaskManager,
 } from "../task/index.js";
+import {
+  formatObservationReportText,
+  type AgentObservabilityService,
+} from "../observability/index.js";
+import type { WorkflowService } from "../workflow/index.js";
+import { evaluateRecordedRun, loadBuiltInEvalCases } from "../eval/index.js";
 
 const VERSION = "0.1.0";
 const DEFAULT_THINKING_LEVEL: ThinkingLevel = DEFAULT_RUNTIME_THINKING_LEVEL;
@@ -288,6 +294,9 @@ export async function startInteractiveApp(
         agentStatusFooter,
         sandboxStatus,
         session,
+        observability: runtime.observability,
+        workflows: runtime.workflows,
+        taskManager: runtime.taskManager,
         setSession,
         setThinkingLevel: (level) => {
           thinkingLevel = level;
@@ -334,9 +343,6 @@ export async function startInteractiveApp(
           0,
         ),
       );
-      enqueueSubmit(formatTaskCompletionNotification(event.task), {
-        inputKind: "task_notification",
-      });
     });
 
     tui.start();
@@ -394,6 +400,9 @@ interface SubmitContext {
   agentStatusFooter: AgentStatusFooter;
   sandboxStatus: SandboxStatus;
   session: SessionManager;
+  observability: AgentObservabilityService;
+  workflows: WorkflowService;
+  taskManager: TaskManager;
   setSession: (session: SessionManager) => void;
   qgisRuntime: QgisRuntimeInfo | undefined;
   setQgisRuntime: (runtime: QgisRuntimeInfo | undefined) => void;
@@ -450,6 +459,15 @@ async function handleSubmit(
         return;
       case "/session":
         addTranscript(context, createSessionInfoMessage(context));
+        return;
+      case "/observe":
+        addTranscript(context, createObservationMessage(getCommandArgument(input), context.observability));
+        return;
+      case "/workflow":
+        await handleWorkflowCommand(getCommandArgument(input), context);
+        return;
+      case "/eval":
+        handleEvalCommand(getCommandArgument(input), context);
         return;
       case "/resume":
         await handleResumeCommand(context);
@@ -633,6 +651,75 @@ function createSessionInfoMessage(
     2,
     0,
   );
+}
+
+function createObservationMessage(
+  argument: string | undefined,
+  observability: AgentObservabilityService,
+): Text {
+  const [requestedView = "summary", rawLimit] = (argument ?? "").trim().split(/\s+/u);
+  const allowed = new Set(["summary", "runs", "tools", "errors", "timeline"]);
+  const view = allowed.has(requestedView) ? requestedView : "summary";
+  const parsedLimit = rawLimit ? Number.parseInt(rawLimit, 10) : 200;
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 200;
+  return new Text(
+    formatObservationReportText(observability.getReport({ limit }), view),
+    2,
+    0,
+  );
+}
+
+async function handleWorkflowCommand(argument: string | undefined, context: SubmitContext): Promise<void> {
+  const [operation = "list", id] = (argument ?? "").trim().split(/\s+/u);
+  let message: string;
+  try {
+    if (operation === "list") {
+      const workflows = context.workflows.list();
+      message = workflows.length > 0
+        ? workflows.map((item) => `${item.id} · ${item.name} · ${item.nodes.length} nodes`).join("\n")
+        : "当前工作区还没有工作流。使用 /workflow draft <Agent Run ID> 创建草稿。";
+    } else if (operation === "draft" && id) {
+      const workflow = context.workflows.createFromRun(id);
+      message = `已创建 ${workflow.id}（${workflow.nodes.length} 个节点）。使用 /workflow show ${workflow.id} 检查后再执行。`;
+    } else if (operation === "show" && id) {
+      const workflow = context.workflows.get(id);
+      message = `${workflow.name} (${workflow.id})\n${workflow.nodes.map((node) => `- ${node.id}: ${node.tool} · dependencies ${node.dependencies.join(", ") || "none"} · outputs ${node.outputPaths.join(", ") || "none"}`).join("\n")}`;
+    } else if (operation === "run" && id) {
+      const task = context.workflows.submit(context.taskManager, id);
+      message = `工作流任务已提交：${task.id}。可使用 /workflow status ${id} 查看节点状态。`;
+    } else if (operation === "status" && id) {
+      const execution = context.workflows.getExecution(id);
+      message = execution
+        ? `${id}: ${execution.status}\n${Object.values(execution.nodes).map((node) => `- ${node.nodeId}: ${node.status}${node.error ? ` · ${node.error}` : ""}`).join("\n")}`
+        : "该工作流还没有执行记录。";
+    } else {
+      message = "用法：/workflow list | draft <Agent Run ID> | show <workflow ID> | run <workflow ID> | status <workflow ID>";
+    }
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  addTranscript(context, new Text(message, 2, 0));
+}
+
+function handleEvalCommand(argument: string | undefined, context: SubmitContext): void {
+  const [operation = "cases", caseId, runId] = (argument ?? "").trim().split(/\s+/u);
+  let message: string;
+  try {
+    const cases = loadBuiltInEvalCases();
+    if (operation === "cases") {
+      message = cases.map((item) => `${item.id} · ${item.name} · ${item.tags?.join(", ") ?? ""}`).join("\n");
+    } else if (operation === "run" && caseId && runId) {
+      const selected = cases.find((item) => item.id === caseId);
+      if (!selected) throw new Error(`评测用例不存在：${caseId}`);
+      const result = evaluateRecordedRun({ ...selected, projectDir: context.session.getProjectDir() }, runId);
+      message = `${result.passed ? "通过" : "未通过"} · ${selected.name} · Run ${runId}\n${result.checks.map((check) => `${check.passed ? "✓" : "✗"} ${check.name}: ${check.detail}`).join("\n")}\n工具 ${result.metrics.toolCalls} · Token ${result.metrics.totalTokens} · 耗时 ${result.metrics.durationMs} ms`;
+    } else {
+      message = "用法：/eval cases | /eval run <caseId> <Run ID>；批量和隔离执行请用 citybrain eval --help";
+    }
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  addTranscript(context, new Text(message, 2, 0));
 }
 
 function createQgisStatusMessage(runtime: QgisRuntimeInfo | undefined): Text {

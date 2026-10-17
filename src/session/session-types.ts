@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatToolCall, ModelUsage } from "../models/model-chat.js";
+import type { SubagentTraceStep } from "../agent/agent-status.js";
 
 export interface SessionHeader {
   type: "session";
@@ -66,11 +67,21 @@ export interface ContextReplacementEntry extends SessionEntryBase {
   projectedTokens: number;
 }
 
+export interface SubagentTraceEntry extends SessionEntryBase {
+  type: "subagent_trace";
+  parentToolCallId: string;
+  subagentType: string;
+  label: string;
+  status: "completed" | "failed";
+  steps: SubagentTraceStep[];
+}
+
 export type SessionEntry =
   | SessionMessageEntry
   | ModelChangeEntry
   | CompactionEntry
-  | ContextReplacementEntry;
+  | ContextReplacementEntry
+  | SubagentTraceEntry;
 export type SessionFileEntry = SessionHeader | SessionEntry;
 
 export interface SessionInfo {

@@ -14,6 +14,9 @@ import type { ToolExecutionLogger } from "../tools/core/observability/tool-execu
 import type { MapStateStore } from "./map-state-store.js";
 import type { MapCommandBridge } from "./map-command-bridge.js";
 import type { VisualizationStateStore } from "./visualization-state-store.js";
+import type { WorkspaceProfileScheduler } from "../profile/index.js";
+import type { AgentObservabilityService } from "../observability/index.js";
+import type { WorkflowService } from "../workflow/index.js";
 
 export interface AgentRuntimeDependencies {
   authStorage: AuthStorage;
@@ -32,7 +35,12 @@ export interface AgentRuntimeDependencies {
   mapStateStore: MapStateStore;
   mapCommandBridge: MapCommandBridge;
   visualizationStateStore: VisualizationStateStore;
+  profileScheduler: WorkspaceProfileScheduler;
+  observability: AgentObservabilityService;
+  workflows: WorkflowService;
   unsubscribeHumanInteractionLog?: () => void;
+  unsubscribeProfileTaskEvents?: () => void;
+  unsubscribeTaskObservability?: () => void;
   onSessionChanged?: (session: SessionManager) => void;
   onQgisRuntimeChanged?: (runtime: QgisRuntimeInfo | undefined) => void;
 }
@@ -57,11 +65,16 @@ export class AgentRuntime {
   readonly mapStateStore: MapStateStore;
   readonly mapCommandBridge: MapCommandBridge;
   readonly visualizationStateStore: VisualizationStateStore;
+  readonly profileScheduler: WorkspaceProfileScheduler;
+  readonly observability: AgentObservabilityService;
+  readonly workflows: WorkflowService;
 
   private session: SessionManager;
   private qgisRuntime: QgisRuntimeInfo | undefined;
   private thinkingLevel: ThinkingLevel;
   private readonly unsubscribeHumanInteractionLog?: () => void;
+  private readonly unsubscribeProfileTaskEvents?: () => void;
+  private readonly unsubscribeTaskObservability?: () => void;
   private readonly onSessionChanged?: (session: SessionManager) => void;
   private readonly onQgisRuntimeChanged?: (
     runtime: QgisRuntimeInfo | undefined,
@@ -85,8 +98,13 @@ export class AgentRuntime {
     this.mapStateStore = dependencies.mapStateStore;
     this.mapCommandBridge = dependencies.mapCommandBridge;
     this.visualizationStateStore = dependencies.visualizationStateStore;
+    this.profileScheduler = dependencies.profileScheduler;
+    this.observability = dependencies.observability;
+    this.workflows = dependencies.workflows;
     this.unsubscribeHumanInteractionLog =
       dependencies.unsubscribeHumanInteractionLog;
+    this.unsubscribeProfileTaskEvents = dependencies.unsubscribeProfileTaskEvents;
+    this.unsubscribeTaskObservability = dependencies.unsubscribeTaskObservability;
     this.onSessionChanged = dependencies.onSessionChanged;
     this.onQgisRuntimeChanged = dependencies.onQgisRuntimeChanged;
   }
@@ -101,6 +119,11 @@ export class AgentRuntime {
 
   setSession(session: SessionManager): void {
     this.assertActive();
+    if (session.getWorkspaceDir() !== this.session.getWorkspaceDir() &&
+      this.taskManager.list({ workspaceDir: this.session.getWorkspaceDir() }).some((task) =>
+        task.metadata?.kind === "workflow" && ["queued", "running"].includes(task.status))) {
+      throw new Error("Cannot switch workspaces while a workflow task is active.");
+    }
     this.session = session;
     this.agentLoop.setSession(session);
     this.onSessionChanged?.(session);
@@ -133,6 +156,8 @@ export class AgentRuntime {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribeHumanInteractionLog?.();
+    this.unsubscribeProfileTaskEvents?.();
+    this.unsubscribeTaskObservability?.();
     this.humanInteractionBroker.cancelAll(reason);
     this.taskManager.dispose(reason);
     this.mapCommandBridge.dispose(reason);

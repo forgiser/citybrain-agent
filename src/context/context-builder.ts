@@ -63,9 +63,9 @@ export function buildStaticSections(inputs: ContextBuildInputs): SystemPromptSec
   const role = inputs.rolePrompt ?? DEFAULT_QB_ROLE_PROMPT;
   return [
     systemPromptSection("role", () => role),
-    systemPromptSection("mission", () => getMission()),
-    systemPromptSection("working_discipline", () => getWorkingDiscipline()),
-    systemPromptSection("tool_semantics", () => getToolSemantics()),
+    systemPromptSection("mission", () => inputs.missionPrompt ?? getMission()),
+    systemPromptSection("working_discipline", () => inputs.workingDisciplinePrompt ?? getWorkingDiscipline()),
+    systemPromptSection("tool_semantics", () => inputs.toolSemanticsPrompt ?? getToolSemantics()),
     systemPromptSection("tone", () => getTone()),
     systemPromptSection("output_efficiency", () => getOutputEfficiency()),
     ...(inputs.hostPrompt?.staticSections ?? []).map((section) =>
@@ -103,6 +103,7 @@ function getToolSemantics(): string {
     "edit_file    — replace an exact unique string in a workspace text file; read it first.",
     "get_task_status / list_tasks — inspect background work only when the user explicitly asks for status.",
     "Background task completion is delivered automatically as a task notification. Never poll a task in a loop.",
+    "A QGIS call moved to the background is pending, not completed. Do not substitute another processing algorithm just because it is still running; wait for its final result before choosing dependent steps.",
     "cancel_task — explicitly request cancellation of one background task.",
     "Never consume artifacts from a queued, running, or cancelling background task.",
     "Concurrency-safe tools may run in parallel; steps that depend on each other run sequentially.",
@@ -199,6 +200,11 @@ export function buildVolatileSections(
       "background task state changes independently of the conversation turn",
     ),
     volatileSystemPromptSection(
+      "workspace_profile",
+      () => inputs.workspaceProfileSummary ?? null,
+      "the workspace profile is refreshed asynchronously after completed turns",
+    ),
+    volatileSystemPromptSection(
       "working_directories",
       () => {
         const directories = [cwd, ...(inputs.additionalWorkingDirectories ?? [])]
@@ -223,9 +229,9 @@ function buildStaticBlocks(
 ): Record<string, string> {
   return {
     role: inputs.rolePrompt ?? DEFAULT_QB_ROLE_PROMPT,
-    mission: getMission(),
-    working_discipline: getWorkingDiscipline(),
-    tool_semantics: getToolSemantics(),
+    mission: inputs.missionPrompt ?? getMission(),
+    working_discipline: inputs.workingDisciplinePrompt ?? getWorkingDiscipline(),
+    tool_semantics: inputs.toolSemanticsPrompt ?? getToolSemantics(),
     tone: getTone(),
     output_efficiency: getOutputEfficiency(),
     ...Object.fromEntries(

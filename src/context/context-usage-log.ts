@@ -12,6 +12,8 @@ export class ContextUsageLogger {
 
   constructor(private readonly getLogPath: () => string) {}
 
+  flush(): Promise<void> { return this.writeQueue; }
+
   record(snapshot: ContextUsageSnapshot): Promise<void> {
     const line = `${JSON.stringify({
       schemaVersion: 1,

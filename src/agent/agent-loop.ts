@@ -49,7 +49,11 @@ import {
 } from "../tools/core/execution/streaming-tool-executor.js";
 import { HarnessController } from "../harness/index.js";
 import type { HumanInteractionBroker } from "../harness/human-interaction.js";
-import type { TaskManager } from "../task/index.js";
+import {
+  formatTaskCompletionNotification,
+  type TaskManager,
+  type TaskSnapshot,
+} from "../task/index.js";
 export type { ToolProgress } from "../tools/core/contracts/tool-types.js";
 export type {
   ToolExecutionResult,
@@ -83,6 +87,14 @@ export interface AgentRunOptions extends StreamChatOptions {
   inputKind?: "user" | "task_notification";
 }
 
+export interface AgentRunCompletedEvent {
+  runId: string;
+  sessionId: string;
+  projectDir: string;
+  workspaceDir: string;
+  artifactPaths: string[];
+}
+
 export class AgentLoop {
   constructor(
     private readonly modelRuntime: ModelRuntime,
@@ -94,7 +106,8 @@ export class AgentLoop {
     private readonly contextTraceLogger?: ContextTraceLogger,
     private readonly getContextInputs?: () => ContextBuildInputs,
     private readonly humanInteractionBroker?: HumanInteractionBroker,
-    taskManager?: TaskManager,
+    private readonly taskManager?: TaskManager,
+    private readonly onRunCompleted?: (event: AgentRunCompletedEvent) => void | Promise<void>,
   ) {
     this.streamingToolExecutor = new StreamingToolExecutor(tools, taskManager);
   }
@@ -110,6 +123,10 @@ export class AgentLoop {
     options: AgentRunOptions = {},
   ): AsyncGenerator<AgentEvent, string, undefined> {
     const runId = randomUUID();
+    const artifactsBefore = new Map(
+      this.tools.artifacts.snapshot().map((record) => [record.normalizedPath, record.registeredAt]),
+    );
+    let completed = false;
     const harness = new HarnessController({
       runId,
       humanInteractionBroker: this.humanInteractionBroker,
@@ -171,7 +188,13 @@ export class AgentLoop {
     let lastToolBatchSignature = "";
     let identicalToolBatchCount = 0;
     let requestIndex = 0;
-    const toolHistory: Array<{ name: string; ok: boolean }> = [];
+    const toolHistory: Array<{
+      name: string;
+      status: ToolExecutionOutcome["status"];
+      taskId: string;
+    }> = [];
+    const backgroundTaskIds = new Set<string>();
+    const consumedBackgroundTaskIds = new Set<string>();
 
     const transition = (
       next: AgentHarnessState,
@@ -261,8 +284,34 @@ export class AgentLoop {
         : "fallback";
 
       while (true) {
+        // Deliver completed detached results before asking the model to plan
+        // another step. Otherwise a model that keeps using other tools may
+        // never reach the no-tool branch that waits for notifications.
+        for (const taskId of backgroundTaskIds) {
+          if (consumedBackgroundTaskIds.has(taskId)) continue;
+          const task = this.taskManager?.get(taskId);
+          if (!task || !isBackgroundTaskTerminal(task.status)) continue;
+          consumedBackgroundTaskIds.add(taskId);
+          const historyItem = toolHistory.find((item) => item.taskId === taskId);
+          if (historyItem) {
+            historyItem.status = task.status === "completed" ? "completed" : "failed";
+          }
+          const notification = formatTaskCompletionNotification(task);
+          conversationMessages.push({ role: "user", content: notification });
+          this.session.appendMessage({
+            role: "user",
+            content: notification,
+            visibility: "system",
+          });
+        }
+        const pendingQgisTaskIds = [...backgroundTaskIds].filter((taskId) => {
+          if (consumedBackgroundTaskIds.has(taskId)) return false;
+          const task = this.taskManager?.get(taskId);
+          return task?.name === "run_qgis_algorithm" &&
+            !isBackgroundTaskTerminal(task.status);
+        });
         const contextInputs = this.getContextInputs?.() ?? {};
-        const systemPrompt = await buildSystemPromptForCwd(
+        const baseSystemPrompt = await buildSystemPromptForCwd(
           this.session.getProjectDir(),
           {
             ...contextInputs,
@@ -271,6 +320,9 @@ export class AgentLoop {
               readAnalysisTask(this.session.getWorkspaceDir()),
           },
         );
+        const systemPrompt = pendingQgisTaskIds.length > 0
+          ? `${baseSystemPrompt}\n\nQGIS processing is still running in background task(s): ${pendingQgisTaskIds.join(", ")}. This is pending, not a successful result. Do not start another QGIS processing algorithm as a substitute or consume its output yet. The run_qgis_algorithm tool is temporarily unavailable. Continue only genuinely independent work with the remaining tools; if none exists, make no tool call and the runtime will wait for the completion notification.`
+          : baseSystemPrompt;
         let projection = await projectContextMessages(
           conversationMessages,
           this.session.getWorkspaceDir(),
@@ -278,9 +330,14 @@ export class AgentLoop {
           projectionState,
         );
         appendProjectionReplacements(this.session, projection.newReplacements);
+        // QGIS writes are exclusive today. Until the pending result arrives,
+        // the runtime cannot prove that a second algorithm is independent.
         const availableTools = finalizationRequested
           ? []
-          : this.tools.definitions();
+          : this.tools.definitions().filter((tool) =>
+            pendingQgisTaskIds.length === 0 ||
+            tool.function.name !== "run_qgis_algorithm"
+          );
         const compression = await compressContextMessages(
           projection.messages,
           {
@@ -403,6 +460,51 @@ export class AgentLoop {
         finalThinking += thinking;
 
         if (toolCalls.size === 0) {
+          const pendingBackgroundTaskIds = [...backgroundTaskIds].filter(
+            (taskId) => !consumedBackgroundTaskIds.has(taskId),
+          );
+          if (pendingBackgroundTaskIds.length > 0 && this.taskManager) {
+            // A model response without tool_use is not a terminal condition while
+            // tools detached by this same run still have an unconsumed result.
+            // Keep the generator alive, wait internally (not through an LLM
+            // wait_task call), inject terminal notifications, then ask the model
+            // to continue the original task in this same AgentLoop.
+            yield transition(
+              "waiting_for_tools",
+              `waiting for ${pendingBackgroundTaskIds.length} background task(s)`,
+            );
+            if (response.trim()) {
+              conversationMessages.push({ role: "assistant", content: response });
+              this.session.appendMessage({
+                provider: model.provider,
+                model: model.id,
+                role: "assistant",
+                content: response,
+              });
+            }
+            const completedTasks = await this.waitForBackgroundTasks(
+              pendingBackgroundTaskIds,
+              options.signal,
+            );
+            for (const taskId of pendingBackgroundTaskIds) {
+              consumedBackgroundTaskIds.add(taskId);
+            }
+            for (const task of completedTasks) {
+              const historyItem = toolHistory.find((item) => item.taskId === task.id);
+              if (historyItem) {
+                historyItem.status = task.status === "completed" ? "completed" : "failed";
+              }
+              const notification = formatTaskCompletionNotification(task);
+              conversationMessages.push({ role: "user", content: notification });
+              this.session.appendMessage({
+                role: "user",
+                content: notification,
+                visibility: "system",
+              });
+            }
+            turn += 1;
+            continue;
+          }
           if (response.trim()) {
             finalResponse = response;
           } else if (!finalizationRequested) {
@@ -478,7 +580,14 @@ export class AgentLoop {
         for (let index = 0; index < resolvedToolCalls.length; index++) {
           const outcome = outcomes[index]!;
           const toolCall = resolvedToolCalls[index]!;
-          toolHistory.push({ name: toolCall.name, ok: outcome.ok });
+          if (outcome.status === "background") {
+            backgroundTaskIds.add(outcome.taskId);
+          }
+          toolHistory.push({
+            name: toolCall.name,
+            status: outcome.status,
+            taskId: outcome.taskId,
+          });
           conversationMessages.push({
             role: "tool",
             content: outcome.content,
@@ -526,6 +635,7 @@ export class AgentLoop {
         usage: latestUsage,
       });
       syncHarnessState("completed", "final answer persisted");
+      completed = true;
       return finalResponse;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -552,6 +662,22 @@ export class AgentLoop {
       throw error;
     } finally {
       unsubscribeHuman?.();
+      if (completed && this.onRunCompleted) {
+        const artifactPaths = this.tools.artifacts.snapshot()
+          .filter((record) => record.status === "ready" && artifactsBefore.get(record.normalizedPath) !== record.registeredAt)
+          .map((record) => record.path);
+        try {
+          await this.onRunCompleted({
+            runId,
+            sessionId: this.session.getSessionId(),
+            projectDir: this.session.getProjectDir(),
+            workspaceDir: this.session.getWorkspaceDir(),
+            artifactPaths,
+          });
+        } catch {
+          // Post-run maintenance must never turn a completed answer into a failure.
+        }
+      }
     }
   }
 
@@ -563,8 +689,29 @@ export class AgentLoop {
   ): AsyncGenerator<AgentEvent, ToolExecutionOutcome[], undefined> {
     return yield* this.streamingToolExecutor.execute(
       resolvedToolCalls,
-      { runId, turn, signal },
+      {
+        runId,
+        turn,
+        sessionId: this.session.getSessionId(),
+        transientRun: this.session.isTransient(),
+        signal,
+      },
     );
+  }
+
+  private async waitForBackgroundTasks(
+    taskIds: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<TaskSnapshot[]> {
+    if (!this.taskManager) return [];
+    const snapshots = await Promise.all(
+      taskIds.map(async (taskId) => {
+        const task = this.taskManager?.get(taskId);
+        if (!task) return undefined;
+        return this.taskManager?.wait(taskId, { signal });
+      }),
+    );
+    return snapshots.filter((task): task is TaskSnapshot => task !== undefined);
   }
 
   private async generateContextSummary(
@@ -622,7 +769,7 @@ export class AgentLoop {
 }
 
 function buildFallbackResponse(
-  history: Array<{ name: string; ok: boolean }>,
+  history: Array<{ name: string; status: ToolExecutionOutcome["status"] }>,
   reason: string,
 ): string {
   const summary =
@@ -632,7 +779,7 @@ function buildFallbackResponse(
           .slice(-8)
           .map(
             (item, index) =>
-              `${index + 1}. ${item.name} (${item.ok ? "succeeded" : "failed"})`,
+              `${index + 1}. ${item.name} (${item.status})`,
           )
           .join("\n");
 
@@ -645,6 +792,12 @@ function buildFallbackResponse(
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function isBackgroundTaskTerminal(status: TaskSnapshot["status"]): boolean {
+  return status === "completed" || status === "failed" ||
+    status === "cancelled" || status === "timed_out" ||
+    status === "orphaned";
 }
 
 function appendProjectionReplacements(

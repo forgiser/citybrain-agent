@@ -37,6 +37,10 @@ export interface SystemContextParts {
 export interface ContextBuildInputs {
   /** Semantic role/mission statement. Optional; a built-in default exists. */
   rolePrompt?: string;
+  /** Optional static behavior overrides for a specialized agent. */
+  missionPrompt?: string;
+  workingDisciplinePrompt?: string;
+  toolSemanticsPrompt?: string;
   /** Project-scoped instructions file path (like CLAUDE.md). Optional. */
   projectInstructionPath?: string;
   /** Current analysis task markdown content (ANALYSIS_TASK.md, L1). */
@@ -51,6 +55,8 @@ export interface ContextBuildInputs {
   artifactSummary?: string;
   /** Compact summary of queued/running/recent background tasks. */
   taskSummary?: string;
+  /** Location and freshness of the generated, Agent-readable workspace profile. */
+  workspaceProfileSummary?: string;
   /** Absolute paths the agent is rooted in (for workspace awareness). */
   additionalWorkingDirectories?: string[];
   /** Today's date string, injected as `Today's date: <date>`. */

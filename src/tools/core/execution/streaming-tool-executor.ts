@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { AgentStatusUpdate } from "../../../agent/agent-status.js";
+import { resolve } from "node:path";
+import type { AgentStatusUpdate, SubagentTraceStep } from "../../../agent/agent-status.js";
 import type { ChatToolCall } from "../../../models/model-chat.js";
 import {
   ToolRegistry,
@@ -70,11 +71,14 @@ export type StreamingToolEvent =
       error: HarnessError;
       decision?: HarnessRecoveryDecision;
     }
-  | ({ type: "agent_status" } & AgentStatusUpdate);
+  | ({ type: "agent_status" } & AgentStatusUpdate)
+  | { type: "subagent_event"; parentToolCallId: string; event: SubagentTraceStep };
 
 export interface StreamingToolExecutorOptions {
   runId: string;
   turn: number;
+  sessionId?: string;
+  transientRun?: boolean;
   signal?: AbortSignal;
 }
 
@@ -164,12 +168,16 @@ export class StreamingToolExecutor {
 
       const context = {
         runId: options.runId,
+        sessionId: options.sessionId,
+        transientRun: options.transientRun,
         turn: options.turn,
         toolCallId: toolCall.id,
         signal: metadata.interruptBehavior === "cancel" ? options.signal : undefined,
         queued: true,
         emitAgentStatus: (update: AgentStatusUpdate) =>
           emit({ type: "agent_status", ...update }),
+        emitSubagentEvent: (event: SubagentTraceStep) =>
+          emit({ type: "subagent_event", parentToolCallId: toolCall.id, event }),
         emitProgress: (progress: ToolProgress) =>
           emit({
             type: "tool_progress",
@@ -340,6 +348,13 @@ export class StreamingToolExecutor {
       !metadata.supportsBackground ||
       threshold === undefined
     ) {
+      const dependencyFailure = await this.waitForArtifactDependencies(
+        toolCall,
+        metadata,
+        foregroundContext?.signal,
+        emit,
+      );
+      if (dependencyFailure) return dependencyFailure;
       return this.tools.execute(
         toolCall.name,
         toolCall.arguments,
@@ -368,6 +383,25 @@ export class StreamingToolExecutor {
       return outcomeFromTask(settled);
     }
 
+    if (toolCall.name === "run_qgis_algorithm" && foregroundContext?.sessionId) {
+      const pendingQgis = this.taskManager.list({
+        statuses: ["queued", "running", "cancelling"],
+        name: "run_qgis_algorithm",
+      }).find((task) => task.metadata?.detached === true &&
+        task.metadata?.sessionId === foregroundContext?.sessionId);
+      if (pendingQgis) {
+        return createDeferredByBackgroundOutcome(toolCall, pendingQgis.id);
+      }
+    }
+
+    const dependencyFailure = await this.waitForArtifactDependencies(
+      toolCall,
+      metadata,
+      foregroundContext?.signal,
+      emit,
+    );
+    if (dependencyFailure) return dependencyFailure;
+
     let attached = true;
     let removeForegroundAbort = (): void => {};
     let resolvePreflight: (() => void) | undefined;
@@ -380,13 +414,17 @@ export class StreamingToolExecutor {
       description: metadata.activityDescription ?? `Running ${toolCall.name}`,
       deduplicationKey,
       resourceKeys: buildResourceKeys(metadata, sandbox),
-      artifactPaths: metadata.writePaths ?? [],
+      artifactPaths: resolveToolPaths(metadata.writePaths, sandbox, true),
       metadata: {
         kind: "tool_execution",
         detached: false,
         source: metadata.source,
         toolCallId: toolCall.id,
         runId: foregroundContext?.runId,
+        sessionId: foregroundContext?.sessionId,
+        transientRun: foregroundContext?.transientRun,
+        projectDir: sandbox?.projectDir,
+        workspaceDir: sandbox?.workspaceRoot,
         backgroundAfterMs: threshold,
       },
       runner: (taskContext) => this.runBackgroundTool(
@@ -442,6 +480,56 @@ export class StreamingToolExecutor {
     attached = false;
     const latest = this.taskManager.get<ToolExecutionOutcome>(task.id) ?? task;
     return createBackgroundOutcome(latest, false);
+  }
+
+  private async waitForArtifactDependencies(
+    toolCall: ChatToolCall,
+    metadata: ReturnType<ToolRegistry["describeCall"]>,
+    signal: AbortSignal | undefined,
+    emit: (event: StreamingToolEvent) => void,
+  ): Promise<ToolExecutionOutcome | undefined> {
+    if (!this.taskManager) return undefined;
+    const sandbox = this.tools.getSandboxPolicy();
+    const paths = new Set([
+      ...resolveToolPaths(metadata.readPaths, sandbox, false),
+      ...resolveToolPaths(metadata.writePaths, sandbox, true),
+    ].map(normalizeDependencyPath));
+    if (paths.size === 0) return undefined;
+    const dependencies = this.taskManager.list({
+      statuses: ["queued", "running", "cancelling"],
+    }).filter((task) => task.metadata?.kind === "tool_execution" &&
+      task.artifactPaths.some((path) =>
+        paths.has(normalizeDependencyPath(path))
+      ));
+    if (dependencies.length === 0) return undefined;
+
+    emit({
+      type: "tool_lifecycle",
+      name: toolCall.name,
+      argumentsText: toolCall.arguments,
+      taskId: toolCall.id,
+      toolCallId: toolCall.id,
+      lifecycle: {
+        taskId: toolCall.id,
+        stage: "tool_queued",
+        ok: true,
+        detail: `waiting for ${dependencies.length} upstream artifact task(s)`,
+      },
+    });
+    const settled = await Promise.all(dependencies.map((task) =>
+      this.taskManager!.wait(task.id, { signal })
+    ));
+    const failed = settled.find((task) =>
+      task.status !== "completed" ||
+      (isStoredToolOutcome(task.result) && !task.result.ok)
+    );
+    if (!failed) return undefined;
+    return {
+      ok: false,
+      status: "failed",
+      taskId: `dependency-${toolCall.id}`,
+      content: `Tool ${toolCall.name} was not started because upstream task ${failed.id} ${failed.status}. Review its completion result before planning the next processing step.`,
+    };
   }
 
   private async runBackgroundTool(
@@ -529,6 +617,33 @@ function buildResourceKeys(
   return keys;
 }
 
+function resolveToolPaths(
+  paths: readonly string[] | undefined,
+  sandbox: ReturnType<ToolRegistry["getSandboxPolicy"]>,
+  write: boolean,
+): string[] {
+  return (paths ?? []).map((path) => {
+    try {
+      return write
+        ? sandbox?.resolveWritePath(path) ?? resolve(path)
+        : sandbox?.resolveReadPath(path) ?? resolve(path);
+    } catch {
+      // The registry remains responsible for reporting invalid paths.
+      return resolve(path);
+    }
+  });
+}
+
+function normalizeDependencyPath(path: string): string {
+  const absolute = resolve(path).replace(/[\\/]+/gu, "\\");
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
+function isStoredToolOutcome(value: unknown): value is ToolExecutionOutcome {
+  return typeof value === "object" && value !== null &&
+    typeof (value as { ok?: unknown }).ok === "boolean";
+}
+
 function createBackgroundOutcome(
   task: TaskSnapshot<ToolExecutionOutcome>,
   reused: boolean,
@@ -547,6 +662,7 @@ function createBackgroundOutcome(
       `Task ID: ${task.id}`,
       `Task status: ${task.status}`,
       "The final result is NOT available yet.",
+      "This is pending, not a successful processing result. Do not start a substitute QGIS algorithm for this step.",
       "Do not poll this task. Its terminal result will be delivered automatically as a task notification.",
       artifacts,
     ].filter(Boolean).join("\n"),
@@ -602,7 +718,7 @@ function createDeferredByBackgroundOutcome(
     taskId: `deferred-${toolCall.id}`,
     content: [
       `Tool ${toolCall.name} was not started because exclusive task ${backgroundTaskId} is still running in the background.`,
-      `Wait for ${backgroundTaskId} and retry this tool afterward.`,
+      `Its final result will be delivered automatically. Reassess the processing plan after that notification; do not retry or substitute another algorithm meanwhile.`,
     ].join("\n"),
   };
 }

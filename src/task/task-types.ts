@@ -5,11 +5,12 @@ export type TaskStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "timed_out";
+  | "timed_out"
+  | "orphaned";
 
 export type TaskTerminalStatus = Extract<
   TaskStatus,
-  "completed" | "failed" | "cancelled" | "timed_out"
+  "completed" | "failed" | "cancelled" | "timed_out" | "orphaned"
 >;
 
 export type TaskCancellationKind = "cancelled" | "timed_out";
@@ -41,6 +42,13 @@ export interface TaskSnapshot<TResult = unknown> {
   name: string;
   description?: string;
   deduplicationKey?: string;
+  idempotencyKey?: string;
+  recoveryKey?: string;
+  recoveryPayload?: Record<string, unknown>;
+  attempt?: number;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+  heartbeatAt?: string;
   resourceKeys: string[];
   status: TaskStatus;
   createdAt: string;
@@ -74,6 +82,11 @@ export interface TaskSubmission<TResult = unknown> {
   runner: TaskRunner<TResult>;
   /** Active tasks with the same key are reused instead of submitted twice. */
   deduplicationKey?: string;
+  /** Repeated submissions with this key reuse the persisted task, including after restart. */
+  idempotencyKey?: string;
+  /** Only tasks with a registered recovery handler may be replayed after restart. */
+  recoveryKey?: string;
+  recoveryPayload?: Record<string, unknown>;
   /** Tasks sharing a resource key never run at the same time. */
   resourceKeys?: readonly string[];
   timeoutMs?: number;
@@ -84,6 +97,7 @@ export interface TaskSubmission<TResult = unknown> {
 export interface TaskListFilter {
   statuses?: readonly TaskStatus[];
   name?: string;
+  workspaceDir?: string;
 }
 
 export interface TaskWaitOptions {
@@ -101,6 +115,8 @@ export type TaskEventType =
   | "failed"
   | "cancelled"
   | "timed_out"
+  | "orphaned"
+  | "recovered"
   | "deleted";
 
 export interface TaskEvent<TResult = unknown> {
@@ -117,6 +133,7 @@ export function isTaskTerminal(
     status === "completed" ||
     status === "failed" ||
     status === "cancelled" ||
-    status === "timed_out"
+    status === "timed_out" ||
+    status === "orphaned"
   );
 }

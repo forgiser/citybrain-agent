@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildEvalReport, evaluateRecordedRun, formatEvalReportMarkdown, loadBuiltInEvalCases } from "../../eval/index.js";
 import { ArtifactService } from "../../artifacts/index.js";
 import { openInBrowser } from "../../integrations/qgis/qgis-setup.js";
 import { SessionManager } from "../../session/session-manager.js";
@@ -238,15 +239,75 @@ function registerApi(
     });
   });
 
-  server.get("/api/tasks", async () => runtime.taskManager.list());
+  server.get("/api/tasks", async () => runtime.taskManager.list({ workspaceDir: runtime.getSession().getWorkspaceDir() }));
+  server.get("/api/evals/cases", async () => loadBuiltInEvalCases().map(({ id, name, prompt, tags, expected }) => ({ id, name, prompt, tags, expected })));
+  server.post("/api/sessions/:sessionId/evals", async (request) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    const body = asRecord(request.body);
+    const caseId = readRequiredString(body.caseId, "caseId");
+    const runId = readRequiredString(body.runId, "runId");
+    const testCase = loadBuiltInEvalCases().find((item) => item.id === caseId);
+    if (!testCase) throw new Error(`Eval case not found: ${caseId}`);
+    const result = evaluateRecordedRun({ ...testCase, projectDir: runtime.getSession().getProjectDir() }, runId);
+    const report = buildEvalReport([result], { model: "recorded (model not attributed)", promptVersion: "current", codeVersion: "working-tree" });
+    return { report, markdown: formatEvalReportMarkdown(report) };
+  });
+  server.get("/api/sessions/:sessionId/observability", async (request) => {
+    const { sessionId } = request.params as { sessionId: string };
+    requireSession(sessionId, sessions, runtime);
+    if (runtime.getSession().getSessionId() !== sessionId) {
+      throw new Error("Activate the session before reading its observability report.");
+    }
+    const query = request.query as { limit?: string; runId?: string };
+    const parsedLimit = query.limit ? Number.parseInt(query.limit, 10) : undefined;
+    return runtime.observability.getReport({
+      ...(parsedLimit !== undefined && Number.isFinite(parsedLimit) ? { limit: parsedLimit } : {}),
+      ...(readOptionalString(query.runId) ? { runId: readOptionalString(query.runId) } : {}),
+    });
+  });
+  server.get("/api/sessions/:sessionId/workflows", async (request) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    return runtime.workflows.list();
+  });
+  server.post("/api/sessions/:sessionId/workflows", async (request, reply) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    const body = asRecord(request.body);
+    const workflow = runtime.workflows.createFromRun(readRequiredString(body.runId, "runId"), readOptionalString(body.name));
+    reply.code(201);
+    return workflow;
+  });
+  server.get("/api/sessions/:sessionId/workflows/:workflowId", async (request) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    const { workflowId } = request.params as { workflowId: string };
+    return { definition: runtime.workflows.get(workflowId), execution: runtime.workflows.getExecution(workflowId) };
+  });
+  server.patch("/api/sessions/:sessionId/workflows/:workflowId/nodes/:nodeId", async (request) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    const { workflowId, nodeId } = request.params as { workflowId: string; nodeId: string };
+    if (runtime.taskManager.list({ workspaceDir: runtime.getSession().getWorkspaceDir() }).some((task) =>
+      task.metadata?.kind === "workflow" && task.recoveryPayload?.workflowId === workflowId &&
+      ["queued", "running"].includes(task.status))) {
+      throw new Error("Cannot edit a workflow while it is running.");
+    }
+    return runtime.workflows.updateNodeArguments(workflowId, nodeId, asRecord(request.body));
+  });
+  server.post("/api/sessions/:sessionId/workflows/:workflowId/runs", async (request, reply) => {
+    requireActiveWorkflowSession(request.params, sessions, runtime);
+    const { workflowId } = request.params as { workflowId: string };
+    const task = runtime.workflows.submit(runtime.taskManager, workflowId);
+    reply.code(202);
+    return task;
+  });
   server.get("/api/tasks/:taskId", async (request) => {
     const { taskId } = request.params as { taskId: string };
     const task = runtime.taskManager.get(taskId);
-    if (!task) throw new Error(`Task not found: ${taskId}`);
+    if (!task || task.metadata?.workspaceDir !== runtime.getSession().getWorkspaceDir()) throw new Error(`Task not found: ${taskId}`);
     return task;
   });
   server.post("/api/tasks/:taskId/cancel", async (request) => {
     const { taskId } = request.params as { taskId: string };
+    const task = runtime.taskManager.get(taskId);
+    if (!task || task.metadata?.workspaceDir !== runtime.getSession().getWorkspaceDir()) throw new Error(`Task not found: ${taskId}`);
     return { cancelled: runtime.taskManager.cancel(taskId, "cancelled from Web UI") };
   });
 
@@ -608,6 +669,19 @@ function registerApi(
   });
 }
 
+function requireActiveWorkflowSession(
+  params: unknown,
+  sessions: Map<string, SessionManager>,
+  runtime: AgentRuntime,
+): SessionManager {
+  const { sessionId } = params as { sessionId: string };
+  const session = requireSession(sessionId, sessions, runtime);
+  if (runtime.getSession().getSessionId() !== sessionId) {
+    throw new Error("Activate this session before managing its workflows.");
+  }
+  return session;
+}
+
 function resolveAgentArtifactPath(session: SessionManager, requestedPath: string): string {
   const path = resolve(session.getProjectDir(), requestedPath);
   const policy = SandboxPolicy.fromWorkspace(session.getWorkspaceDir(), session.getProjectDir());
@@ -724,13 +798,23 @@ function toSessionSummary(session: SessionManager): Record<string, unknown> {
 }
 
 function toSessionDetails(session: SessionManager): Record<string, unknown> {
+  const entries = session.getEntries();
   return {
     ...toSessionSummary(session),
-    messages: session.getEntries()
+    messages: entries
       .filter((entry): entry is SessionMessageEntry =>
         entry.type === "message" && entry.message.visibility !== "system"
       )
       .map((entry) => ({ id: entry.id, timestamp: entry.timestamp, ...entry.message })),
+    subagentTraces: entries
+      .filter((entry) => entry.type === "subagent_trace")
+      .map((entry) => ({
+        parentToolCallId: entry.parentToolCallId,
+        subagentType: entry.subagentType,
+        label: entry.label,
+        status: entry.status,
+        steps: entry.steps,
+      })),
   };
 }
 

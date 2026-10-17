@@ -5,6 +5,9 @@ import { startWebApp } from "../adapters/web/index.js";
 import { startInteractiveApp } from "../app/interactive-app.js";
 import { createAgentRuntime } from "../runtime/index.js";
 import { createAgentHostProfile } from "../host/index.js";
+import { runWorkspaceProfileWorker } from "../profile/index.js";
+import { runEvalCli } from "../eval/eval-cli.js";
+import { runWorkflowCli } from "../workflow/workflow-cli.js";
 
 type LaunchMode = "cli" | "web";
 
@@ -22,10 +25,25 @@ function buildProgram(): Command {
     .argument("[command]", "cli or web")
     .option("--mode <mode>", "launch mode: cli or web")
     .option("--port <port>", "local Web UI port", "3170")
-    .option("--no-open", "do not open the browser automatically");
+    .option("--no-open", "do not open the browser automatically")
+    .addHelpText("after", "\n独立命令：\n  citybrain eval --help\n  citybrain workflow --help\nCLI 交互命令：/observe、/workflow\n");
 }
 
 export async function runCli(argv: string[]): Promise<void> {
+  if (argv[2] === "eval") {
+    await runEvalCli(argv.slice(3));
+    return;
+  }
+  if (argv[2] === "workflow") {
+    await runWorkflowCli(argv.slice(3));
+    return;
+  }
+  if (argv[2] === "__profile-worker") {
+    const jobPath = argv[3];
+    if (!jobPath) throw new Error("A profile worker job path is required.");
+    await runWorkspaceProfileWorker(jobPath);
+    return;
+  }
   const program = buildProgram();
   program.parse(argv);
   const options = program.opts<LaunchOptions>();

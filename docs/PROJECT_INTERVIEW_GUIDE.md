@@ -177,12 +177,13 @@ QGIS Processing 包含大量算法，如果逐一开发工具，会造成维护�
 当前方案参考 Claude Code 的执行所有权转移：
 
 1. 工具只启动一次，由 `TaskManager` 托管同一个执行实例。
-2. `StreamingToolExecutor` 前台等待最多两分钟。
+2. `StreamingToolExecutor` 前台等待最多一分钟。
 3. 超过阈值后标记 `detached: true`，解除前台 Run 对任务的取消绑定。
 4. Agent 不再轮询，也没有 `wait_task` 工具。
 5. 任务进入终态后产生 `<task-notification>`。
-6. CLI 或 Web 的运行管理器将通知作为隐藏系统输入重新交给 Agent。
-7. Agent 使用最终工具结果继续原任务。
+6. 如果模型没有新的 `tool_use`，Agent Loop 会检查本轮尚未消费的后台 taskId；仍有任务时保持 Run 活跃并在运行时内部等待。
+7. 终态通知作为隐藏系统输入追加到同一个上下文，Agent 使用最终工具结果继续原任务。
+8. 只有“没有新工具调用”并且“没有未消费的本轮后台任务”同时成立时，Loop 才能结束。
 
 后台化不是“换一个 JavaScript 线程”，而是将同一个异步任务从前台等待转为事件驱动托管。QGIS 计算本身运行在独立子进程中，Node.js 负责状态与事件协调。
 
@@ -235,13 +236,43 @@ TaskManager 支持：
 
 - 新建独立 SessionManager；
 - 子工具集中不注册 `delegate`，避免无限递归；
-- 只开放文件、QGIS 和必要任务工具；
+- 按 `subagent_type` 强制区分 `data-explorer`（只读文件探查）和 `spatial-planner`（只读文件与 QGIS 算法定义查询）；
+- 两类均无文件写入、QGIS 处理执行、地图操作和后台任务管理工具；
 - 继承主运行时的 sandbox、QGIS 配置和日志能力；
 - 子过程事件不直接污染主对话，只回传最终总结和状态。
 
-当前限制：子智能体使用标准 SessionManager，执行消息会生成普通 JSONL 会话文件，Web 会话扫描可能将其识别为普通对话。推荐后续增加 `createTransient()` 内存会话，或增加 `kind: subagent` 与 `parentSessionId` 后分层展示。
+子智能体使用 `SessionManager.createTransient()` 创建纯内存会话，保持独立上下文但不生成普通 JSONL 文件，因此不会污染 Web 会话列表。工具执行与用量仍通过共享的结构化日志记录，便于诊断和审计。
 
 关键代码：`src/tools/delegate/index.ts`。
+
+### 7.6.1 对话后画像是后台作业，不是子智能体
+
+项目把两类后台能力明确拆开：`delegate` 面向需要模型推理的临时子任务；工作区画像面向确定性的元数据维护，不需要新的 Agent Loop，也不应该形成会话。主 Agent 只有在一次回答完整成功后才提交画像作业，失败、中止和 transient 子智能体运行都不会触发它。
+
+实现链路如下：
+
+```text
+主对话成功完成
+  → 收集本轮新增或更新的 artifact 路径
+  → 持久化 jobs/*.json
+  → detached Node.js Worker
+  → 文件指纹判断是否变化
+  → QGIS/GDAL 或轻量解析器生成 datasets/*.json
+  → 原子更新 index.json
+  → 重建 Agent 可读的 citybrain/profile.md
+```
+
+这里没有用 `TaskManager` 承载最终执行，因为 `TaskManager` 服务于当前运行时中的工具生命周期；画像要求在主程序退出后仍能运行，因此采用独立进程和磁盘任务状态。两者都是后台任务，但生命周期和恢复边界不同。
+
+为避免每轮全量扫描，正常路径只处理 Artifact Registry 报告的变化文件；首次运行或间隔达到阈值时才做轻量对账。索引使用绝对路径、大小和 `mtime` 指纹复用未变化画像，删除数据时同步移除对应 JSON。最终 `profile.md` 从小型索引重新生成，而不是重新分析所有原始数据，因此生成汇总的成本很低。
+
+关键代码：
+
+- `src/profile/profile-scheduler.ts`
+- `src/profile/profile-service.ts`
+- `src/profile/profile-store.ts`
+- `src/agent/agent-loop.ts`
+- `src/runtime/create-runtime.ts`
 
 ### 7.7 System Prompt 按稳定性分层
 
@@ -431,7 +462,7 @@ QGIS 经常通过 `.bat` 配置 OSGeo4W 环境，但直接经 `cmd %*` 转发包
 - 我实现了工具调用去重和资源键冲突控制，避免相同任务重复执行或多个任务同时写同一结果路径。
 - 我分析真实日志定位 `wait_task` 轮询问题，并参考 Claude Code 改为同一执行实例的前后台所有权转移。
 - 我移除了模型侧 `wait_task`，改为任务终态事件主动回注 Agent，降低无效模型轮次并理清取消边界。
-- 我将耗时工具后台升级阈值设置为两分钟，并保留用户主动查询、取消和列出任务的能力。
+- 我将耗时工具后台升级阈值设置为一分钟，并保留用户主动查询、取消和列出任务的能力。
 
 ### 9.3 QGIS 与空间数据
 
@@ -457,13 +488,18 @@ QGIS 经常通过 `.bat` 配置 OSGeo4W 环境，但直接经 `cmd %*` 转发包
 
 - 我实现了动态 HITL 工具及其分类、风险、结构化选项、超时和 CLI/Web 展示。
 - 我实现了子智能体委派、空上下文隔离、受限工具集和最终结果回传。
+- 我将子智能体会话改为纯内存 transient session，避免内部执行记录被 Web 扫描成普通用户对话。
+- 我实现了对话后独立画像 Worker：按本轮产物增量提取矢量、栅格、表格、文档和三维数据元信息，以结构化 JSON 维护内部状态，并自动投影为 Agent 可读的 `profile.md`。
+- 我将画像作业与子智能体、运行时内 TaskManager 分离，通过独立进程、磁盘队列、文件锁和启动恢复保证主对话不阻塞、前台退出后仍可继续且不产生普通会话。
 - 我将地图状态和多模态标签页状态作为 Web 模式易变上下文注入，而不是污染 CLI 模式。
 - 我实现了上下文使用记录、请求投影、大结果压缩和会话恢复基础能力。
 
 ### 9.6 安全与可观测性
 
 - 我建立了项目级 Workspace Sandbox、读写路径检查和内部管理文件保护。
-- 我建立了工具执行、上下文使用和实际模型请求 trace 日志。
+- 我建立了工具执行、上下文使用、实际模型请求 trace 和后台任务生命周期日志。
+- 我实现了统一观测聚合层，以 `runId / taskId / toolCallId` 关联模型、工具、任务、HITL、产物和错误，计算 Token、成功率、平均/P95 耗时等指标。
+- 我同时提供 CLI `/observe` 多视图命令和 Web 设置页观测面板；面板支持 Run 筛选、活动任务、时间线与自动刷新，并避免向浏览器暴露完整 Prompt 正文。
 - 我将产物状态与任务状态关联，防止 Agent 提前消费未完成文件。
 
 ## 10. 可直接用于简历的项目描述
@@ -493,11 +529,11 @@ QGIS 算法数量大且不同版本存在差异。逐一封装维护成本高，
 
 ### Q3：后台运行是不是换了线程？
 
-不是。TaskManager 托管同一个 Promise 和 AbortController，超过两分钟后只发生前台所有权转移。Node 主线程仍负责异步事件，QGIS 计算实际位于独立子进程。纯 JavaScript CPU 密集任务如果出现，仍需要 Worker Thread 或独立进程。
+不是。TaskManager 托管同一个 Promise 和 AbortController，超过一分钟后只发生前台所有权转移。Node 主线程仍负责异步事件，QGIS 计算实际位于独立子进程。纯 JavaScript CPU 密集任务如果出现，仍需要 Worker Thread 或独立进程。
 
 ### Q4：为什么删除 `wait_task`？
 
-模型轮询会浪费 token、占用模型轮次、触发重复调用保护，并让任务取消语义复杂。终态推送能够在任务真正结束时唤醒 Agent，使模型只处理一次最终结果。
+模型轮询会浪费 token、占用模型轮次、触发重复调用保护，并让任务取消语义复杂。现在由 Agent Loop 在代码层等待本轮关联的 Task Promise；这个等待不调用大模型。任务结束后只把一次终态结果回注同一个上下文，使模型只处理一次最终结果。
 
 ### Q5：如何避免一个工具被重复执行？
 
@@ -537,17 +573,23 @@ System Prompt 明确只有缺少信息会改变方案或存在风险时才调用
 
 ### Q14：子智能体如何避免无限递归？
 
-子智能体使用独立 Tool Registry，注册文件和 QGIS 工具，但不注册 `delegate`。因此它无法继续创建子智能体。同时子智能体从空会话开始，主 Agent 必须提供自包含任务。
+子智能体使用按类型构建的独立 Tool Registry：`data-explorer` 仅有 `list_files`、`read_file`，`spatial-planner` 另有 QGIS 算法列表与描述工具；两者都不注册 `delegate` 或执行/写入工具。因此无法继续创建子智能体，也无法修改数据。同时子智能体从空会话开始，主 Agent 必须提供自包含任务。
 
-### Q15：当前子智能体还有什么问题？
+### Q15：为什么子智能体不形成普通会话？
 
-独立上下文本身已经实现，但它使用普通 SessionManager，执行后可能生成与普通会话相同的 JSONL 文件。下一步应实现 transient session，或给 SessionHeader 增加 kind 和 parentSessionId，让 UI 过滤或按树展示。
+委派执行使用 `SessionManager.createTransient()`，消息只保存在当前子代理实例的内存中，不创建可恢复 JSONL，因此 Web 会话扫描天然看不到它。子代理仍共享工具执行日志和上下文用量日志，既避免用户会话列表被内部执行污染，也保留必要的可观测性。若未来需要恢复长时间子任务，可另建具有 `kind` 和 `parentSessionId` 的内部持久会话，而不是退回普通用户会话。
 
-### Q16：如何做可观测性？
+### Q16：为什么数据画像不是子智能体或普通 TaskManager 任务？
 
-工具执行、进度、产物、失败、HITL 和终态进入 tool execution log；上下文 token 使用进入 usage log；真实发送给模型的 Prompt、消息投影和压缩报告进入 trace log。这样可以从日志重建“模型看到了什么、工具执行了什么、为什么失败”。
+画像是确定性的维护工作，不需要 LLM 推理，因此创建 Agent Loop 和对话只会增加 token、会话污染与生命周期耦合。普通 TaskManager 负责当前 Node.js 运行时中的工具执行，进程退出后不能继续托管；画像则先持久化任务，再启动 detached Worker，使用工作区文件锁串行消费队列。这样主回答不等待画像，Worker 不创建会话，异常退出后也能从 `jobs/*.json` 恢复。
 
-### Q17：最大的工程取舍是什么？
+### Q17：如何做可观测性？
+
+我把观测分成采集、关联、聚合和呈现四层。工具执行、进度、产物、失败、HITL 和 Agent 状态进入 `tool-execution.jsonl`；上下文 Token 进入 `context-usage.jsonl`；真实请求、消息投影和压缩报告进入 `context-trace.jsonl`；后台任务生命周期进入 `task-events.jsonl`。统一的 `AgentObservabilityService` 再以 `runId / taskId / toolCallId` 关联这些事件，生成 Run、模型、工具、任务、HITL、产物、错误等维度的指标和时间线。
+
+呈现层不侵入 Agent Loop：CLI 使用 `/observe summary|runs|tools|errors|timeline`，Web 在“设置 → 可观测性”中显示 Token、平均模型延迟、工具成功率、P95、活动任务和最近事件，并可按 Run 筛选和自动刷新。完整 Prompt 只保存在本地 trace 日志，Web API 只返回聚合结果与截断摘要；读取层对超大 trace 采用有上限的尾部读取并显式返回 `loadedBytes / truncated`，避免观测刷新反过来阻塞 Agent 主事件循环。
+
+### Q18：最大的工程取舍是什么？
 
 当前优先做本地单进程可运行闭环，因此 TaskStore 默认内存实现、Web 地图使用整幅影像、Sandbox 是应用层策略。它们降低 MVP 复杂度，但进程重启恢复、超大栅格和强隔离仍需要持久队列、瓦片服务与进程/容器级执行器。
 
@@ -563,14 +605,13 @@ System Prompt 明确只有缺少信息会改变方案或存在风险时才调用
 8. 加载 DEM/GeoTIFF，切换灰度、分级设色或山体阴影。
 9. 展示图层准备 loading、显隐、透明度和缩放。
 10. 构造一个需要方案选择的需求，展示对话内动态 HITL。
-11. 解释超过两分钟的 QGIS 工具如何后台化并自动回注结果。
+11. 解释超过一分钟的 QGIS 工具如何后台化并自动回注结果。
 
 ## 13. 当前限制与后续优化
 
 | 当前限制 | 影响 | 后续方案 |
 |---|---|---|
 | TaskManager 默认内存存储 | 进程退出后 runner 无法恢复 | 持久化任务队列、worker lease、启动恢复策略 |
-| 子智能体会话仍会持久化为普通会话 | Web 会话列表可能混入内部会话 | transient session 或 session kind/parentSessionId |
 | 栅格使用整幅 PNG image source | 超大栅格加载和显存压力较大 | COG、XYZ/WMTS 瓦片、金字塔缓存 |
 | DEM 瓦片由本地进程按需生成 | 首次浏览未缓存区域存在计算开销，难以直接横向扩容 | COG/预生成金字塔、独立瓦片服务、共享缓存 |
 | 单体三维模型由浏览器完整加载 | 大模型会占用网络、内存和 GPU，缺少层级细节 | 大场景转换为 3D Tiles、压缩纹理和几何、按需加载 |

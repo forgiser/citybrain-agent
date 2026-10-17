@@ -2,11 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentEvent } from "../agent/agent-loop.js";
 import type { HumanInteractionEvent } from "../harness/human-interaction.js";
 import {
-  formatTaskCompletionNotification,
-  isTaskTerminal,
-  isToolExecutionTask,
   type TaskEvent,
-  type TaskSnapshot,
 } from "../task/index.js";
 import type { AgentRuntime } from "./agent-runtime.js";
 import type {
@@ -23,7 +19,6 @@ interface ManagedRun {
   listeners: Set<(event: RuntimeEventEnvelope) => void>;
   abortController: AbortController;
   nextSequence: number;
-  pendingTaskNotifications: TaskSnapshot[];
 }
 
 const MAX_EVENTS_PER_RUN = 2_000;
@@ -33,7 +28,6 @@ export class RunManager {
   private readonly runs = new Map<string, ManagedRun>();
   private readonly agentRunToRun = new Map<string, string>();
   private activeRunId: string | undefined;
-  private notificationDrainScheduled = false;
   private readonly unsubscribeTask: () => void;
   private readonly unsubscribeHuman: () => void;
   private disposed = false;
@@ -75,7 +69,6 @@ export class RunManager {
       listeners: new Set(),
       abortController: new AbortController(),
       nextSequence: 1,
-      pendingTaskNotifications: [],
     };
     this.runs.set(run.snapshot.id, run);
     this.activeRunId = run.snapshot.id;
@@ -126,10 +119,9 @@ export class RunManager {
     return Boolean(run && !isTerminal(run.snapshot.status));
   }
 
-  /** Retry delivery of terminal task notifications after a session switch. */
+  /** Kept for host compatibility; task completion is consumed inside AgentLoop. */
   notifySessionActivated(): void {
     this.assertActive();
-    this.scheduleNotificationDrain();
   }
 
   dispose(): void {
@@ -178,55 +170,6 @@ export class RunManager {
       }
     } finally {
       if (this.activeRunId === run.snapshot.id) this.activeRunId = undefined;
-      this.scheduleNotificationDrain();
-    }
-  }
-
-  private async executeTaskNotification(
-    run: ManagedRun,
-    task: TaskSnapshot,
-  ): Promise<void> {
-    if (run.snapshot.status === "cancelled") return;
-    this.activeRunId = run.snapshot.id;
-    this.updateStatus(run, "running");
-    this.publish(run, "task.notification", { task });
-    try {
-      const stream = this.runtime.agentLoop.run(
-        formatTaskCompletionNotification(task),
-        {
-          thinkingLevel: this.runtime.getThinkingLevel(),
-          inputKind: "task_notification",
-          signal: run.abortController.signal,
-        },
-      );
-      let response = "";
-      for await (const event of stream) {
-        this.captureAgentRunId(run, event);
-        if (event.type === "text") {
-          response += event.delta;
-          this.publish(run, "message.text_delta", { delta: event.delta });
-        } else if (event.type === "thinking") {
-          this.publish(run, "message.thinking_delta", { delta: event.delta });
-        } else {
-          this.publish(run, "agent.event", { event });
-        }
-        this.captureArtifacts(run, event);
-      }
-      if (!run.abortController.signal.aborted) {
-        this.updateStatus(run, "completed");
-        this.publish(run, "run.completed", { response, continuation: true });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (run.abortController.signal.aborted) {
-        this.updateStatus(run, "cancelled", message);
-      } else {
-        this.updateStatus(run, "failed", message);
-        this.publish(run, "run.failed", { error: message, continuation: true });
-      }
-    } finally {
-      if (this.activeRunId === run.snapshot.id) this.activeRunId = undefined;
-      this.scheduleNotificationDrain();
     }
   }
 
@@ -262,37 +205,6 @@ export class RunManager {
         paths: event.task.artifactPaths,
       });
     }
-    if (
-      isTaskTerminal(event.task.status) &&
-      isToolExecutionTask(event.task) &&
-      !run.pendingTaskNotifications.some((task) => task.id === event.task.id)
-    ) {
-      run.pendingTaskNotifications.push(event.task);
-      this.scheduleNotificationDrain();
-    }
-  }
-
-  private scheduleNotificationDrain(): void {
-    if (this.notificationDrainScheduled || this.disposed) return;
-    this.notificationDrainScheduled = true;
-    queueMicrotask(() => {
-      this.notificationDrainScheduled = false;
-      void this.drainTaskNotifications();
-    });
-  }
-
-  private async drainTaskNotifications(): Promise<void> {
-    if (this.disposed || this.hasActiveRun()) return;
-    const run = [...this.runs.values()]
-      .sort((left, right) => left.snapshot.createdAt.localeCompare(right.snapshot.createdAt))
-      .find((candidate) =>
-        candidate.snapshot.status !== "cancelled" &&
-        candidate.pendingTaskNotifications.length > 0 &&
-        candidate.snapshot.sessionId === this.runtime.getSession().getSessionId()
-      );
-    const task = run?.pendingTaskNotifications.shift();
-    if (!run || !task) return;
-    await this.executeTaskNotification(run, task);
   }
 
   private handleHumanInteractionEvent(event: HumanInteractionEvent): void {

@@ -57,6 +57,22 @@ export const shellCommands: ShellCommand[] = [
     description: "展示当前会话的信息",
   },
   {
+    name: "/observe",
+    description: "查看 Agent 全链路观测摘要、运行、工具、错误或时间线",
+    argumentHint: "[summary|runs|tools|errors|timeline] [limit]",
+    aliases: ["/obs"],
+  },
+  {
+    name: "/workflow",
+    description: "从 Run 生成、查看并执行可复现的空间分析工作流",
+    argumentHint: "[list|draft <runId>|show <workflowId>|run <workflowId>|status <workflowId>]",
+  },
+  {
+    name: "/eval",
+    description: "列出 GIS 基准用例或评测当前工作区中已完成的 Run",
+    argumentHint: "[cases|run <caseId> <runId>]",
+  },
+  {
     name: "/quit",
     description: "退出CityBrain",
     aliases: ["/exit"],

@@ -7,7 +7,8 @@
     "dist",
     "README.md",
     "PUBLISHING.md",
-    "docs"
+    "docs",
+    "evals"
   ],
   "bin": {
     "citybrain": "dist/main.js"
@@ -45,6 +46,11 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "typecheck:web": "tsc --noEmit -p web/tsconfig.json",
     "check": "npm run typecheck && npm run typecheck:web",
+    "smoke:profile": "npm run build:server && node scripts/profile-worker-smoke.mjs",
+    "smoke:observability": "npm run build:server && node scripts/observability-smoke.mjs",
+    "smoke:p0": "npm run build:server && node scripts/p0-smoke.mjs",
+    "smoke:subagent": "npm run build:server && node scripts/subagent-smoke.mjs",
+    "eval": "npm run build:server && node dist/main.js eval",
     "prepack": "npm run check && npm run build"
   },
   "dependencies": {

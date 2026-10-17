@@ -74,6 +74,8 @@ export class ToolExecutionLogger {
 
   constructor(private readonly getLogPath: () => string) {}
 
+  flush(): Promise<void> { return this.writeQueue; }
+
   record(
     event: Omit<ToolExecutionLogEvent, "schemaVersion" | "timestamp">,
   ): Promise<void> {

@@ -31,6 +31,7 @@ import type {
   SessionMessageEntry,
   CompactionEntry,
   ContextReplacementEntry,
+  SubagentTraceEntry,
   SessionEntryBase,
 } from "./session-types.js";
 import type { PersistedToolResultProjection } from "../context/context-projection.js";
@@ -89,6 +90,7 @@ export class SessionManager {
     private header: SessionHeader,
     private sessionFile: string,
     private entries: SessionEntry[],
+    private readonly persistence: "persistent" | "transient" = "persistent",
   ) {}
 
   static create(cwd: string = process.cwd(), sessionsRoot: string = getSessionsRoot()): SessionManager {
@@ -96,6 +98,21 @@ export class SessionManager {
     const sessionDirectory = getSessionDirectory(header.cwd, sessionsRoot);
     const sessionFile = createSessionFile(sessionDirectory, header.timestamp, header.id);
     return new SessionManager(header, sessionFile, []);
+  }
+
+  /**
+   * Create an isolated, in-memory session which never writes a transcript file.
+   * Intended for delegated/subagent runs whose context must not appear in the
+   * user's resumable conversation list.
+   */
+  static createTransient(
+    cwd: string = process.cwd(),
+    sessionsRoot: string = getSessionsRoot(),
+  ): SessionManager {
+    const header = createHeader(cwd);
+    const sessionDirectory = getSessionDirectory(header.cwd, sessionsRoot);
+    const sessionFile = createSessionFile(sessionDirectory, header.timestamp, header.id);
+    return new SessionManager(header, sessionFile, [], "transient");
   }
 
   static continueRecent(
@@ -178,7 +195,11 @@ export class SessionManager {
   }
 
   isPersisted(): boolean {
-    return existsSync(this.sessionFile);
+    return !this.isTransient() && existsSync(this.sessionFile);
+  }
+
+  isTransient(): boolean {
+    return this.persistence === "transient";
   }
 
   getCwd(): string {
@@ -350,6 +371,20 @@ export class SessionManager {
     return entry.id;
   }
 
+  appendSubagentTrace(
+    trace: Pick<SubagentTraceEntry, "parentToolCallId" | "subagentType" | "label" | "status" | "steps">,
+  ): string {
+    const entry: SubagentTraceEntry = {
+      type: "subagent_trace",
+      id: createEntryId(),
+      parentId: this.getLeafId(),
+      timestamp: new Date().toISOString(),
+      ...trace,
+    };
+    this.appendEntry(entry);
+    return entry.id;
+  }
+
   appendModelChange(provider: string, modelId: string): string {
     const entry: ModelChangeEntry = {
       type: "model_change",
@@ -413,6 +448,7 @@ export class SessionManager {
   /** Remove conversation/history while preserving this session identity and workspace. */
   clearConversation(): void {
     this.entries = [];
+    if (this.isTransient()) return;
     mkdirSync(dirname(this.sessionFile), { recursive: true });
     writeFileSync(this.sessionFile, `${JSON.stringify(this.header)}\n`, "utf8");
   }
@@ -435,12 +471,14 @@ export class SessionManager {
   }
 
   private appendEntry(entry: SessionEntry): void {
-    this.ensureFile();
     this.entries.push(entry);
+    if (this.isTransient()) return;
+    this.ensureFile();
     appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`, "utf8");
   }
 
   private ensureFile(): void {
+    if (this.isTransient()) return;
     mkdirSync(dirname(this.sessionFile), { recursive: true });
     if (!existsSync(this.sessionFile)) {
       writeFileSync(
@@ -453,6 +491,7 @@ export class SessionManager {
 
   /** 把改动后的会话头写回文件首行（JSONL 首行即 header）。 */
   private persistHeader(): void {
+    if (this.isTransient()) return;
     if (!this.isPersisted()) return;
     const lines = readFileSync(this.sessionFile, "utf8").split(/\r?\n/u);
     lines[0] = JSON.stringify(this.header);
@@ -529,6 +568,16 @@ function isSessionFileEntry(value: unknown): value is SessionFileEntry {
       typeof value.projectedTokens === "number" &&
       (value.toolName === undefined || typeof value.toolName === "string")
     );
+  }
+
+  if (value.type === "subagent_trace") {
+    return typeof value.parentToolCallId === "string"
+      && typeof value.subagentType === "string"
+      && typeof value.label === "string"
+      && (value.status === "completed" || value.status === "failed")
+      && Array.isArray(value.steps)
+      && value.steps.every((step: unknown) => isRecord(step)
+        && ["text", "thinking", "tool_started", "tool_result"].includes(step.type));
   }
 
   if (value.type === "message" && isRecord(value.message)) {

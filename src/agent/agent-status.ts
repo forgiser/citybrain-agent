@@ -16,3 +16,17 @@ export interface AgentStatusUpdate {
   usage?: ModelUsage;
   error?: string;
 }
+
+/** UI/audit-safe child activity linked to the parent delegate tool call. */
+export interface SubagentTraceStep {
+  type: "text" | "thinking" | "tool_started" | "tool_result";
+  delta?: string;
+  name?: string;
+  toolCallId?: string;
+  argumentsText?: string;
+  result?: string;
+  ok?: boolean;
+  status?: string;
+  activityDescription?: string;
+  toolUseSummary?: string;
+}

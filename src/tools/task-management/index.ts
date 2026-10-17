@@ -25,7 +25,7 @@ function createGetTaskStatusTool(taskManager: TaskManager): ToolSpec {
         parameters: taskIdSchema(),
       },
     },
-    handler: async (args) => formatTask(requireTask(taskManager, getTaskId(args))),
+    handler: async (args, context) => formatTask(requireTask(taskManager, getTaskId(args), context?.sandbox?.workspaceRoot)),
     metadata: readOnlyMetadata("Checking background task status"),
   };
 }
@@ -49,15 +49,15 @@ function createCancelTaskTool(taskManager: TaskManager): ToolSpec {
         },
       },
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       const taskId = getTaskId(args);
-      const current = requireTask(taskManager, taskId);
+      const current = requireTask(taskManager, taskId, context?.sandbox?.workspaceRoot);
       if (isTaskTerminal(current.status)) return formatTask(current);
       const reason = isRecord(args) && typeof args.reason === "string"
         ? args.reason.trim() || "cancelled by agent"
         : "cancelled by agent";
       taskManager.cancel(taskId, reason);
-      return formatTask(requireTask(taskManager, taskId));
+      return formatTask(requireTask(taskManager, taskId, context?.sandbox?.workspaceRoot));
     },
     metadata: {
       source: "builtin",
@@ -94,9 +94,9 @@ function createListTasksTool(taskManager: TaskManager): ToolSpec {
         },
       },
     },
-    handler: async (args) => {
+    handler: async (args, context) => {
       const activeOnly = isRecord(args) && args.activeOnly === true;
-      const tasks = taskManager.list().filter(
+      const tasks = taskManager.list({ workspaceDir: context?.sandbox?.workspaceRoot }).filter(
         (task) => !activeOnly || !isTaskTerminal(task.status),
       );
       if (tasks.length === 0) return "No background tasks.";
@@ -142,9 +142,9 @@ function getTaskIdSafe(args: unknown): string | undefined {
     : undefined;
 }
 
-function requireTask(taskManager: TaskManager, taskId: string): TaskSnapshot {
+function requireTask(taskManager: TaskManager, taskId: string, workspaceDir?: string): TaskSnapshot {
   const task = taskManager.get(taskId);
-  if (!task) throw new Error(`Background task does not exist: ${taskId}`);
+  if (!task || (workspaceDir && task.metadata?.workspaceDir !== workspaceDir)) throw new Error(`Background task does not exist: ${taskId}`);
   return task;
 }
 

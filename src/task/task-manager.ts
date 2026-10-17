@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import {
   isTaskTerminal,
   type TaskCancellationKind,
@@ -35,7 +36,10 @@ interface ManagedTask {
   controller: AbortController;
   cancellationKind?: TaskCancellationKind;
   timeout?: ReturnType<typeof setTimeout>;
+  heartbeat?: ReturnType<typeof setInterval>;
 }
+
+export type TaskRecoveryHandler = (payload: Record<string, unknown>, snapshot: TaskSnapshot) => TaskRunner;
 
 interface TaskWaiter {
   resolve: (task: TaskSnapshot) => void;
@@ -64,6 +68,7 @@ export class TaskManager {
   private readonly waiters = new Map<string, Set<TaskWaiter>>();
   private readonly activeDeduplicationKeys = new Map<string, string>();
   private readonly activeResourceKeys = new Set<string>();
+  private readonly leaseOwner = `${process.pid}:${randomUUID()}`;
   private running = 0;
   private drainScheduled = false;
   private disposed = false;
@@ -74,6 +79,7 @@ export class TaskManager {
     this.store = options.store ?? new InMemoryTaskStore();
     this.createId = options.createId ?? (() => `task-${randomUUID()}`);
     this.now = options.now ?? (() => new Date());
+    this.markInterruptedTasks();
   }
 
   submit<TResult>(submission: TaskSubmission<TResult>): TaskSnapshot<TResult> {
@@ -85,6 +91,11 @@ export class TaskManager {
     }
 
     const deduplicationKey = submission.deduplicationKey?.trim();
+    const idempotencyKey = submission.idempotencyKey?.trim();
+    if (idempotencyKey) {
+      const existing = this.store.getByIdempotencyKey?.(idempotencyKey);
+      if (existing) return cloneTaskSnapshot(existing) as TaskSnapshot<TResult>;
+    }
     if (deduplicationKey) {
       const existingId = this.activeDeduplicationKeys.get(deduplicationKey);
       const existing = existingId ? this.get<TResult>(existingId) : undefined;
@@ -104,6 +115,10 @@ export class TaskManager {
         ? { description: submission.description.trim() }
         : {}),
       ...(deduplicationKey ? { deduplicationKey } : {}),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+      ...(submission.recoveryKey?.trim() ? { recoveryKey: submission.recoveryKey.trim() } : {}),
+      ...(submission.recoveryPayload ? { recoveryPayload: structuredClone(submission.recoveryPayload) } : {}),
+      attempt: 1,
       resourceKeys: normalizeKeys(submission.resourceKeys ?? []),
       status: "queued",
       createdAt: timestamp,
@@ -145,6 +160,7 @@ export class TaskManager {
       .list()
       .filter((task) => !statuses || statuses.has(task.status))
       .filter((task) => !name || task.name.toLowerCase().includes(name))
+      .filter((task) => !filter.workspaceDir || (typeof task.metadata?.workspaceDir === "string" && resolve(task.metadata.workspaceDir) === resolve(filter.workspaceDir)))
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
       .map((task) => cloneTaskSnapshot(task) as TaskSnapshot<TResult>);
   }
@@ -200,6 +216,37 @@ export class TaskManager {
   ): TaskSnapshot<TResult> | undefined {
     const taskId = this.activeDeduplicationKeys.get(key.trim());
     return taskId ? this.get<TResult>(taskId) : undefined;
+  }
+
+  /** Reattach a runner only when its caller explicitly declares replay safe. */
+  recover(recoveryKey: string, handler: TaskRecoveryHandler, predicate: (snapshot: TaskSnapshot) => boolean = () => true): TaskSnapshot[] {
+    this.assertActive();
+    const recovered: TaskSnapshot[] = [];
+    for (const snapshot of this.store.list()) {
+      if (snapshot.status !== "orphaned" || snapshot.recoveryKey !== recoveryKey || !snapshot.recoveryPayload || !predicate(snapshot)) continue;
+      const runner = handler(structuredClone(snapshot.recoveryPayload), cloneTaskSnapshot(snapshot));
+      const restored: TaskSnapshot = {
+        ...snapshot,
+        status: "queued",
+        attempt: (snapshot.attempt ?? 1) + 1,
+        updatedAt: this.timestamp(),
+        error: undefined,
+        metadata: { ...(snapshot.metadata ?? {}), recoveryReason: snapshot.error?.message ?? "Recovered after interrupted process." },
+        finishedAt: undefined,
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        heartbeatAt: undefined,
+      };
+      const managed: ManagedTask = { snapshot: restored, runner, controller: new AbortController() };
+      this.tasks.set(restored.id, managed);
+      if (restored.deduplicationKey) this.activeDeduplicationKeys.set(restored.deduplicationKey, restored.id);
+      this.queue.push(restored.id);
+      this.persist(restored);
+      this.emit("recovered", restored);
+      recovered.push(cloneTaskSnapshot(restored));
+    }
+    this.scheduleDrain();
+    return recovered;
   }
 
   /** Update scheduler-owned metadata without changing task lifecycle state. */
@@ -298,8 +345,22 @@ export class TaskManager {
       status: "running",
       startedAt,
       updatedAt: startedAt,
+      leaseOwner: this.leaseOwner,
+      heartbeatAt: startedAt,
+      leaseExpiresAt: new Date(this.now().getTime() + 30_000).toISOString(),
     });
     this.emit("started", task.snapshot);
+
+    task.heartbeat = setInterval(() => {
+      if (isTaskTerminal(task.snapshot.status)) return;
+      const heartbeatAt = this.timestamp();
+      this.update(task, {
+        heartbeatAt,
+        leaseExpiresAt: new Date(this.now().getTime() + 30_000).toISOString(),
+        updatedAt: heartbeatAt,
+      });
+    }, 10_000);
+    task.heartbeat.unref?.();
 
     if (task.snapshot.timeoutMs !== undefined) {
       task.timeout = setTimeout(() => {
@@ -333,6 +394,7 @@ export class TaskManager {
       }
     } finally {
       if (task.timeout) clearTimeout(task.timeout);
+      if (task.heartbeat) clearInterval(task.heartbeat);
     }
   }
 
@@ -401,6 +463,8 @@ export class TaskManager {
       status,
       updatedAt: finishedAt,
       finishedAt,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
       ...(values.result !== undefined ? { result: values.result } : {}),
       ...(values.error ? { error: values.error } : {}),
     });
@@ -436,6 +500,31 @@ export class TaskManager {
       } catch {
         // Observers must not be able to break task execution.
       }
+    }
+    this.store.recordEvent?.(event);
+  }
+
+  private markInterruptedTasks(): void {
+    for (const snapshot of this.store.list()) {
+      if (isTaskTerminal(snapshot.status)) continue;
+      if (snapshot.leaseOwner && isLeaseProcessAlive(snapshot.leaseOwner) &&
+        snapshot.leaseExpiresAt && snapshot.leaseExpiresAt > this.timestamp()) continue;
+      const now = this.timestamp();
+      const orphaned: TaskSnapshot = {
+        ...snapshot,
+        status: "orphaned",
+        updatedAt: now,
+        finishedAt: now,
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        error: {
+          name: "TaskOrphanedError",
+          code: "TASK_ORPHANED",
+          message: "The previous process ended before this task reached a terminal state. No tool was replayed automatically.",
+        },
+      };
+      this.store.save(orphaned);
+      this.store.recordEvent?.({ type: "orphaned", task: orphaned });
     }
   }
 
@@ -568,4 +657,15 @@ function createAbortError(message: string): Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isLeaseProcessAlive(owner: string): boolean {
+  const pid = Number.parseInt(owner.split(":", 1)[0] ?? "", 10);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

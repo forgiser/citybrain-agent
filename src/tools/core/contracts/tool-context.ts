@@ -1,4 +1,5 @@
 import type { AgentStatusUpdate } from "../../../agent/agent-status.js";
+import type { SubagentTraceStep } from "../../../agent/agent-status.js";
 import type { SandboxPolicy } from "../../../workspace/sandbox-policy.js";
 import type { ArtifactRecord, ArtifactRegistry } from "../artifacts/artifact-registry.js";
 import type { FileReadSnapshot } from "../shared/file-write-utils.js";
@@ -8,7 +9,10 @@ import type { ToolLifecycleEvent, ToolProgress } from "./tool-types.js";
 /** Runtime capabilities and correlation data passed to one tool invocation. */
 export interface ToolCallContext {
   emitAgentStatus?: (update: AgentStatusUpdate) => void;
+  emitSubagentEvent?: (event: SubagentTraceStep) => void;
   runId?: string;
+  sessionId?: string;
+  transientRun?: boolean;
   turn?: number;
   toolCallId?: string;
   taskId?: string;
